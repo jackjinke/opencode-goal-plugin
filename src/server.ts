@@ -7,9 +7,10 @@ import {
   createGoal,
   estimateTokensFromText,
   getGoal,
+  markGoalUnmet,
   reserveContinuation,
 } from "./state"
-import { continuationPrompt, systemReminder } from "./prompts"
+import { compactionContext, continuationPrompt, systemReminder } from "./prompts"
 
 type Options = {
   auto_continue?: boolean
@@ -21,6 +22,18 @@ type CreateGoalArgs = {
   objective: string
   token_budget?: number
 }
+
+type UpdateGoalArgs =
+  | {
+      status: "complete"
+      evidence?: string
+      blocker?: string
+    }
+  | {
+      status: "unmet"
+      evidence?: string
+      blocker?: string
+    }
 
 const DEFAULT_MAX_AUTO_TURNS = 25
 const DEFAULT_CONTINUE_INTERVAL_SECONDS = 3
@@ -40,6 +53,37 @@ function estimateMessages(messages: { parts?: unknown[] }[]) {
       (message.parts ?? []).reduce<number>((partSum, part) => partSum + estimateTokensFromText(textFromPart(part)), 0)
     )
   }, 0)
+}
+
+function tokensFromRecord(value: unknown): number | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const tokens = value as Record<string, unknown>
+  if (typeof tokens.total === "number") return tokens.total
+  const cache = tokens.cache && typeof tokens.cache === "object" ? (tokens.cache as Record<string, unknown>) : {}
+  const fields = [tokens.input, tokens.output, tokens.reasoning, cache.read, cache.write]
+  if (!fields.some((field) => typeof field === "number")) return undefined
+  return fields.reduce<number>((sum, field) => sum + (typeof field === "number" && Number.isFinite(field) ? field : 0), 0)
+}
+
+function exactTokensFromPart(part: unknown): number | undefined {
+  if (!part || typeof part !== "object") return undefined
+  const value = part as Record<string, unknown>
+  if (value.type !== "step-finish") return undefined
+  return tokensFromRecord(value.tokens)
+}
+
+function exactTokensFromMessage(message: { info?: unknown; parts?: unknown[] }) {
+  const partTotal = (message.parts ?? []).reduce<number>((sum, part) => sum + (exactTokensFromPart(part) ?? 0), 0)
+  if (partTotal > 0) return partTotal
+  if (message.info && typeof message.info === "object") {
+    return tokensFromRecord((message.info as Record<string, unknown>).tokens)
+  }
+  return undefined
+}
+
+function tokensFromMessages(messages: { info?: unknown; parts?: unknown[] }[]) {
+  const exactTotal = messages.reduce<number>((sum, message) => sum + (exactTokensFromMessage(message) ?? 0), 0)
+  return exactTotal > 0 ? exactTotal : estimateMessages(messages)
 }
 
 async function sendContinuation(client: Parameters<Plugin>[0]["client"], sessionID: string, prompt: string) {
@@ -81,17 +125,42 @@ const server: Plugin = async ({ client }, options?: Options) => {
       },
       update_goal: {
         description:
-          "Use this tool only to mark the existing goal achieved. Set status to complete only when the objective is achieved and no required work remains. Do not mark complete merely because the budget is exhausted or because work is stopping.",
+          "Close the existing goal only after an audit against real evidence. Use status complete only when the objective is achieved and no required work remains, and include evidence. Use status unmet only when the objective cannot be achieved or is blocked, and include the blocker. Do not close a goal merely because the budget is exhausted or because work is stopping.",
         args: {
-          status: z.enum(["complete"]).describe("Required. The only model-controlled status is complete."),
+          status: z.enum(["complete", "unmet"]).describe("Required. complete means achieved; unmet means blocked or impossible."),
+          evidence: z
+            .string()
+            .min(1)
+            .max(4000)
+            .optional()
+            .describe("Required when status is complete. Summarize the concrete evidence verified."),
+          blocker: z
+            .string()
+            .min(1)
+            .max(4000)
+            .optional()
+            .describe("Required when status is unmet. Explain the concrete blocker or impossibility."),
         },
-        async execute(_args, context) {
-          const goal = await completeGoal(context.sessionID)
+        async execute(args, context) {
+          const input = args as UpdateGoalArgs
+          if (input.status === "complete") {
+            const goal = await completeGoal(context.sessionID, input.evidence ?? "")
+            const report =
+              goal.tokenBudget == null
+                ? `Goal achieved. Time used: ${goal.timeUsedSeconds} seconds. Evidence: ${goal.completionEvidence}.`
+                : `Goal achieved. Tokens used: ${goal.tokensUsed} of ${goal.tokenBudget}; time used: ${goal.timeUsedSeconds} seconds. Evidence: ${goal.completionEvidence}.`
+            return JSON.stringify(
+              { goal, remaining_tokens: goal.remainingTokens, completion_budget_report: report },
+              null,
+              2,
+            )
+          }
+          const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "")
           const report =
             goal.tokenBudget == null
-              ? `Goal achieved. Time used: ${goal.timeUsedSeconds} seconds.`
-              : `Goal achieved. Tokens used: ${goal.tokensUsed} of ${goal.tokenBudget}; time used: ${goal.timeUsedSeconds} seconds.`
-          return JSON.stringify({ goal, remaining_tokens: goal.remainingTokens, completion_budget_report: report }, null, 2)
+              ? `Goal unmet. Time used: ${goal.timeUsedSeconds} seconds. Blocker: ${goal.blocker}.`
+              : `Goal unmet. Tokens used: ${goal.tokensUsed} of ${goal.tokenBudget}; time used: ${goal.timeUsedSeconds} seconds. Blocker: ${goal.blocker}.`
+          return JSON.stringify({ goal, remaining_tokens: goal.remainingTokens, unmet_report: report }, null, 2)
         },
       },
       clear_goal: {
@@ -108,11 +177,16 @@ const server: Plugin = async ({ client }, options?: Options) => {
           ? input.sessionID
           : output.messages.find((message) => typeof message.info.sessionID === "string")?.info.sessionID
       if (!sessionID) return
-      await accountUsage(sessionID, estimateMessages(output.messages))
+      await accountUsage(sessionID, tokensFromMessages(output.messages))
     },
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
       output.system.push(systemReminder(await getGoal(input.sessionID)))
+    },
+    async "experimental.session.compacting"(input, output) {
+      const goal = await getGoal(input.sessionID)
+      if (!goal) return
+      output.context.push(compactionContext(goal))
     },
     async event({ event }) {
       if (!autoContinue || event.type !== "session.idle") return

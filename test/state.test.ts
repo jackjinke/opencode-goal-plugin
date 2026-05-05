@@ -8,6 +8,7 @@ import {
   completeGoal,
   createGoal,
   getGoal,
+  markGoalUnmet,
   reserveContinuation,
   setGoalStatus,
 } from "../src/state"
@@ -34,9 +35,29 @@ test("creates, reads, pauses, resumes, completes, and clears a goal", async () =
 
   expect((await setGoalStatus("ses_1", "paused")).status).toBe("paused")
   expect((await setGoalStatus("ses_1", "active")).status).toBe("active")
-  expect((await completeGoal("ses_1")).status).toBe("complete")
+  const completed = await completeGoal("ses_1", "tests passed")
+  expect(completed.status).toBe("complete")
+  expect(completed.completionEvidence).toBe("tests passed")
   expect(await clearGoal("ses_1")).toBe(true)
   expect(await getGoal("ses_1")).toBeNull()
+})
+
+test("marks a goal unmet with a blocker and allows a new goal afterward", async () => {
+  await createGoal("ses_1", "ship the plugin", 100)
+  const unmet = await markGoalUnmet("ses_1", "missing external credentials")
+
+  expect(unmet.status).toBe("unmet")
+  expect(unmet.blocker).toBe("missing external credentials")
+
+  const next = await createGoal("ses_1", "ship follow-up", null)
+  expect(next.status).toBe("active")
+  expect(next.objective).toBe("ship follow-up")
+})
+
+test("requires evidence when closing goals", async () => {
+  await createGoal("ses_1", "ship the plugin", 100)
+  await expect(completeGoal("ses_1", "")).rejects.toThrow("completion evidence must not be empty")
+  await expect(markGoalUnmet("ses_1", "")).rejects.toThrow("blocker must not be empty")
 })
 
 test("marks budget-limited when estimated usage crosses the budget", async () => {

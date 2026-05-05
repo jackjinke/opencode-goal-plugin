@@ -3,7 +3,8 @@ import { dirname, join } from "node:path"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { readFileSync } from "node:fs"
 
-export type GoalStatus = "active" | "paused" | "budgetLimited" | "complete"
+export type GoalStatus = "active" | "paused" | "budgetLimited" | "complete" | "unmet"
+export type MutableGoalStatus = "active" | "paused" | "budgetLimited"
 
 export type Goal = {
   sessionID: string
@@ -14,6 +15,9 @@ export type Goal = {
   timeUsedSeconds: number
   createdAt: number
   updatedAt: number
+  completionEvidence?: string | null
+  blocker?: string | null
+  closedAt?: number | null
   lastAccountedAt: number | null
   autoTurns: number
   lastContinuationAt: number | null
@@ -99,6 +103,17 @@ export function validateBudget(tokenBudget: number | null | undefined) {
   return tokenBudget
 }
 
+export function validateEvidence(evidence: string | null | undefined, label: string) {
+  const value = evidence?.trim()
+  if (!value) throw new Error(`${label} must not be empty`)
+  if ([...value].length > 4000) throw new Error(`${label} must be at most 4000 characters`)
+  return value
+}
+
+function isClosed(status: GoalStatus) {
+  return status === "complete" || status === "unmet"
+}
+
 export function snapshot(goal: Goal): GoalSnapshot {
   const activeSeconds =
     goal.status === "active" && goal.lastAccountedAt != null ? Math.max(0, nowSeconds() - goal.lastAccountedAt) : 0
@@ -112,6 +127,9 @@ export function snapshot(goal: Goal): GoalSnapshot {
     timeUsedSeconds,
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt,
+    completionEvidence: goal.completionEvidence ?? null,
+    blocker: goal.blocker ?? null,
+    closedAt: goal.closedAt ?? null,
     remainingTokens: goal.tokenBudget == null ? null : Math.max(0, goal.tokenBudget - goal.tokensUsed),
   }
 }
@@ -133,8 +151,8 @@ export async function createGoal(sessionID: string, objective: string, tokenBudg
   const budget = validateBudget(tokenBudget)
   return mutate((state) => {
     const existing = state.goals[sessionID]
-    if (existing && existing.status !== "complete") {
-      throw new Error("cannot create a new goal because this session already has a non-complete goal")
+    if (existing && !isClosed(existing.status)) {
+      throw new Error("cannot create a new goal because this session already has a non-closed goal")
     }
     const now = nowSeconds()
     const goal: Goal = {
@@ -146,6 +164,9 @@ export async function createGoal(sessionID: string, objective: string, tokenBudg
       timeUsedSeconds: 0,
       createdAt: now,
       updatedAt: now,
+      completionEvidence: null,
+      blocker: null,
+      closedAt: null,
       lastAccountedAt: now,
       autoTurns: 0,
       lastContinuationAt: null,
@@ -155,7 +176,7 @@ export async function createGoal(sessionID: string, objective: string, tokenBudg
   })
 }
 
-export async function setGoalStatus(sessionID: string, status: GoalStatus) {
+export async function setGoalStatus(sessionID: string, status: MutableGoalStatus) {
   return mutate((state) => {
     const goal = state.goals[sessionID]
     if (!goal) throw new Error("cannot update goal because this session has no goal")
@@ -167,8 +188,44 @@ export async function setGoalStatus(sessionID: string, status: GoalStatus) {
   })
 }
 
-export async function completeGoal(sessionID: string) {
-  return setGoalStatus(sessionID, "complete")
+export async function closeGoal(
+  sessionID: string,
+  input:
+    | {
+        status: "complete"
+        evidence: string
+      }
+    | {
+        status: "unmet"
+        blocker: string
+      },
+) {
+  return mutate((state) => {
+    const goal = state.goals[sessionID]
+    if (!goal) throw new Error("cannot update goal because this session has no goal")
+    accountWallClock(goal)
+    const now = nowSeconds()
+    goal.status = input.status
+    goal.updatedAt = now
+    goal.closedAt = now
+    goal.lastAccountedAt = null
+    if (input.status === "complete") {
+      goal.completionEvidence = validateEvidence(input.evidence, "completion evidence")
+      goal.blocker = null
+    } else {
+      goal.blocker = validateEvidence(input.blocker, "blocker")
+      goal.completionEvidence = null
+    }
+    return snapshot(goal)
+  })
+}
+
+export async function completeGoal(sessionID: string, evidence: string) {
+  return closeGoal(sessionID, { status: "complete", evidence })
+}
+
+export async function markGoalUnmet(sessionID: string, blocker: string) {
+  return closeGoal(sessionID, { status: "unmet", blocker })
 }
 
 export async function clearGoal(sessionID: string) {
@@ -232,11 +289,14 @@ export function estimateTokensFromText(text: string) {
 export function formatGoal(goal: GoalSnapshot | null) {
   if (!goal) return "No goal is set for this session."
   const budget = goal.tokenBudget == null ? "none" : `${goal.tokensUsed} / ${goal.tokenBudget}`
-  return [
+  const lines = [
     `Objective: ${goal.objective}`,
     `Status: ${goal.status}`,
     `Tokens: ${budget}`,
     `Remaining tokens: ${goal.remainingTokens ?? "n/a"}`,
     `Time used: ${goal.timeUsedSeconds}s`,
-  ].join("\n")
+  ]
+  if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
+  if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
+  return lines.join("\n")
 }

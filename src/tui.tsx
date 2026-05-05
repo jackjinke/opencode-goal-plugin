@@ -5,12 +5,15 @@ import { createMemo, Show } from "solid-js"
 type GoalSnapshot = {
   sessionID: string
   objective: string
-  status: "active" | "paused" | "budgetLimited" | "complete"
+  status: "active" | "paused" | "budgetLimited" | "complete" | "unmet"
   tokenBudget: number | null
   tokensUsed: number
   timeUsedSeconds: number
   createdAt: number
   updatedAt: number
+  completionEvidence?: string | null
+  blocker?: string | null
+  closedAt?: number | null
   remainingTokens: number | null
 }
 
@@ -58,42 +61,84 @@ function clearGoalPrompt() {
   return "Clear the current session goal by calling clear_goal. Report whether a goal was cleared."
 }
 
+function showCustomBudget(api: TuiPluginApi, sessionID: string, objective: string) {
+  const DialogPrompt = api.ui.DialogPrompt
+  api.ui.dialog.replace(() =>
+    DialogPrompt({
+      title: "Custom budget",
+      placeholder: "Positive integer",
+      onConfirm(rawBudget) {
+        const value = rawBudget.trim()
+        const budget = Number(value)
+        if (!Number.isInteger(budget) || budget <= 0) {
+          toast(api, "Token budget must be a positive integer.", "warning")
+          return
+        }
+        void sendGoalPrompt(api, sessionID, createGoalPrompt(objective, budget))
+          .then(() => {
+            api.ui.dialog.clear()
+            toast(api, "Goal request sent.", "success")
+          })
+          .catch((error) => toast(api, error instanceof Error ? error.message : String(error), "error"))
+      },
+      onCancel() {
+        api.ui.dialog.clear()
+      },
+    }),
+  )
+}
+
+function showBudgetSelect(api: TuiPluginApi, sessionID: string, objective: string) {
+  const DialogSelect = api.ui.DialogSelect
+  const budgets = [
+    { title: "No budget", value: "none", budget: null, description: "Track progress without a token limit" },
+    { title: "250K", value: "250k", budget: 250_000, description: "Short focused goal" },
+    { title: "1M", value: "1m", budget: 1_000_000, description: "Default long-running goal" },
+    { title: "2M", value: "2m", budget: 2_000_000, description: "Large investigation or migration" },
+    { title: "Custom", value: "custom", budget: undefined, description: "Enter an exact token budget" },
+  ]
+  api.ui.dialog.replace(() =>
+    DialogSelect({
+      title: "Token budget",
+      placeholder: "Choose a budget",
+      options: budgets.map((item) => ({
+        title: item.title,
+        value: item.value,
+        description: item.description,
+        onSelect: () => {
+          if (item.budget === undefined) {
+            showCustomBudget(api, sessionID, objective)
+            return
+          }
+          void sendGoalPrompt(api, sessionID, createGoalPrompt(objective, item.budget))
+            .then(() => {
+              api.ui.dialog.clear()
+              toast(api, "Goal request sent.", "success")
+            })
+            .catch((error) => toast(api, error instanceof Error ? error.message : String(error), "error"))
+        },
+      })),
+      onSelect(option) {
+        option.onSelect?.()
+      },
+    }),
+  )
+}
+
 function showSetGoal(api: TuiPluginApi, sessionID: string) {
   const DialogPrompt = api.ui.DialogPrompt
   api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() =>
     DialogPrompt({
       title: "Set goal",
-      placeholder: "Concrete objective",
+      placeholder: "Objective, scope, non-goals, verification path",
       onConfirm(objective) {
         const trimmed = objective.trim()
         if (!trimmed) {
           toast(api, "Goal objective is required.", "warning")
           return
         }
-        api.ui.dialog.replace(() =>
-          DialogPrompt({
-            title: "Token budget",
-            placeholder: "Optional positive integer",
-            onConfirm(rawBudget) {
-              const value = rawBudget.trim()
-              const budget = value ? Number(value) : null
-              if (budget != null && (!Number.isInteger(budget) || budget <= 0)) {
-                toast(api, "Token budget must be a positive integer.", "warning")
-                return
-              }
-              void sendGoalPrompt(api, sessionID, createGoalPrompt(trimmed, budget))
-                .then(() => {
-                  api.ui.dialog.clear()
-                  toast(api, "Goal request sent.", "success")
-                })
-                .catch((error) => toast(api, error instanceof Error ? error.message : String(error), "error"))
-            },
-            onCancel() {
-              api.ui.dialog.clear()
-            },
-          }),
-        )
+        showBudgetSelect(api, sessionID, trimmed)
       },
       onCancel() {
         api.ui.dialog.clear()
@@ -189,12 +234,15 @@ function isGoalSnapshot(value: unknown): value is GoalSnapshot {
   if (!isRecord(value)) return false
   if (typeof value.sessionID !== "string") return false
   if (typeof value.objective !== "string") return false
-  if (!["active", "paused", "budgetLimited", "complete"].includes(String(value.status))) return false
+  if (!["active", "paused", "budgetLimited", "complete", "unmet"].includes(String(value.status))) return false
   if (value.tokenBudget !== null && typeof value.tokenBudget !== "number") return false
   if (typeof value.tokensUsed !== "number") return false
   if (typeof value.timeUsedSeconds !== "number") return false
   if (typeof value.createdAt !== "number") return false
   if (typeof value.updatedAt !== "number") return false
+  if (value.completionEvidence != null && typeof value.completionEvidence !== "string") return false
+  if (value.blocker != null && typeof value.blocker !== "string") return false
+  if (value.closedAt != null && typeof value.closedAt !== "number") return false
   if (value.remainingTokens !== null && typeof value.remainingTokens !== "number") return false
   return true
 }
@@ -231,13 +279,16 @@ function goalFromSession(api: TuiPluginApi, sessionID: string) {
 function formatGoal(goal: GoalSnapshot | null) {
   if (!goal) return "No recent goal state found in this session."
   const budget = goal.tokenBudget == null ? "none" : `${goal.tokensUsed} / ${goal.tokenBudget}`
-  return [
+  const lines = [
     `Objective: ${goal.objective}`,
     `Status: ${goal.status}`,
     `Tokens: ${budget}`,
     `Remaining tokens: ${goal.remainingTokens ?? "n/a"}`,
     `Time used: ${goal.timeUsedSeconds}s`,
-  ].join("\n")
+  ]
+  if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
+  if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
+  return lines.join("\n")
 }
 
 function GoalSidebar(props: { api: TuiPluginApi; sessionID: string }) {
@@ -266,7 +317,7 @@ function GoalSidebar(props: { api: TuiPluginApi; sessionID: string }) {
     <Show when={goal()}>
       {(value: () => GoalSnapshot) => (
         <Show
-          when={value().status === "complete"}
+          when={value().status === "complete" || value().status === "unmet"}
           fallback={
             <box>
               <text fg={theme().text}>
@@ -280,8 +331,9 @@ function GoalSidebar(props: { api: TuiPluginApi; sessionID: string }) {
             </box>
           }
         >
-          <text fg={theme().primary}>
-            <b>Goal achieved</b> ({formatDurationBadge(value().timeUsedSeconds)})
+          <text fg={value().status === "complete" ? theme().primary : theme().textMuted}>
+            <b>{value().status === "complete" ? "Goal achieved" : "Goal unmet"}</b> (
+            {formatDurationBadge(value().timeUsedSeconds)})
           </text>
         </Show>
       )}

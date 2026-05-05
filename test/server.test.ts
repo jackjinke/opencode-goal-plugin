@@ -48,9 +48,99 @@ test("server plugin exposes Codex-style goal tools", async () => {
   const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
   expect(String(read)).toContain('"objective": "finish"')
 
-  const completed = await requireTool(tools.update_goal, "update_goal").execute({ status: "complete" }, context)
+  const completed = await requireTool(tools.update_goal, "update_goal").execute(
+    { status: "complete", evidence: "verified locally" },
+    context,
+  )
   expect(String(completed)).toContain('"completion_budget_report"')
+  expect(String(completed)).toContain('"completionEvidence": "verified locally"')
   expect(calls).toHaveLength(0)
+})
+
+test("update goal can close as unmet with a blocker", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, context)
+  const unmet = await requireTool(tools.update_goal, "update_goal").execute(
+    { status: "unmet", blocker: "missing credentials" },
+    context,
+  )
+
+  expect(String(unmet)).toContain('"status": "unmet"')
+  expect(String(unmet)).toContain('"blocker": "missing credentials"')
+  expect(String(unmet)).toContain('"unmet_report"')
+})
+
+test("message transform prefers exact step token usage", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish", token_budget: 100 }, context)
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { sessionID: "ses_1" },
+          parts: [
+            {
+              type: "step-finish",
+              tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 3, write: 4 } },
+            },
+          ],
+        },
+      ],
+    } as never,
+  )
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+
+  expect(String(read)).toContain('"tokensUsed": 24')
+})
+
+test("compaction hook preserves active goal context", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, { sessionID: "ses_1" } as never)
+  const output = { context: [] as string[], prompt: undefined }
+  await hooks["experimental.session.compacting"]!({ sessionID: "ses_1" }, output)
+
+  expect(output.context).toHaveLength(1)
+  expect(output.context[0]).toContain("OpenCode goal mode is tracking this session goal across compaction")
+  expect(output.context[0]).toContain("Objective: finish")
 })
 
 test("idle event auto-continues active goals when enabled", async () => {

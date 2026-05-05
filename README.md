@@ -7,8 +7,10 @@ This plugin adds:
 - `/goal` in the OpenCode TUI.
 - A sidebar goal indicator with status, elapsed time, token usage, remaining budget, and objective.
 - Agent tools: `get_goal`, `create_goal`, `update_goal`, and `clear_goal`.
+- Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
 - Persistent per-session goal state.
 - Optional automatic continuation on `session.idle`.
+- Compaction context so active goals are preserved when OpenCode summarizes a long session.
 
 ## Install
 
@@ -71,6 +73,25 @@ Defaults:
 - `max_auto_turns`: `25`
 - `min_continue_interval_seconds`: `3`
 
+## Goal Workflow
+
+Use `/goal` from an OpenCode TUI session to set, refresh, or clear the goal. New goals support budget presets:
+
+- No budget
+- `250K`
+- `1M`
+- `2M`
+- Custom positive integer
+
+When setting the objective, include the scope, non-goals, and verification path when they matter. The agent is reminded to audit real files, command output, tests, or PR state before closing the goal.
+
+The `update_goal` tool can close a goal in two ways:
+
+- `status: "complete"` with `evidence` when every requirement is actually achieved.
+- `status: "unmet"` with `blocker` when the objective cannot be achieved or is blocked by missing external input.
+
+Budget exhaustion does not close a goal by itself. It only marks the goal `budgetLimited` and asks the agent to wrap up with remaining work or blockers.
+
 ## State
 
 Goal state is stored at:
@@ -124,4 +145,4 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Codex goal mode has deeper runtime integration for exact token accounting and thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks, so token usage is estimated from message text and continuation is driven by OpenCode's `session.idle` event.
+Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode's `session.idle` event.
