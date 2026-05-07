@@ -1,6 +1,6 @@
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createMemo, Show } from "solid-js"
+import { createMemo, createSignal, onCleanup, Show } from "solid-js"
 
 type GoalSnapshot = {
   sessionID: string
@@ -125,6 +125,17 @@ function formatDurationBadge(seconds: number) {
   return formatDuration(seconds)
 }
 
+function currentEpochSeconds() {
+  return Math.floor(Date.now() / 1000)
+}
+
+export function liveTimeUsedSeconds(goal: GoalSnapshot, nowSeconds = currentEpochSeconds()) {
+  const baseSeconds = Math.max(0, Math.floor(goal.timeUsedSeconds))
+  if (visibleStatus(goal.status) !== "active") return baseSeconds
+  if (typeof goal.sampledAt !== "number") return baseSeconds
+  return baseSeconds + Math.max(0, Math.floor(nowSeconds - goal.sampledAt))
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
@@ -200,6 +211,9 @@ function formatGoal(goal: GoalSnapshot | null) {
 
 function GoalSidebar(props: { api: TuiPluginApi; sessionID: string }) {
   const theme = () => props.api.theme.current
+  const [nowSeconds, setNowSeconds] = createSignal(currentEpochSeconds())
+  const timer = setInterval(() => setNowSeconds(currentEpochSeconds()), 1000)
+  onCleanup(() => clearInterval(timer))
   const state = createMemo(() => {
     props.api.state.session.messages(props.sessionID)
     return goalStateFromSession(props.api, props.sessionID)
@@ -207,7 +221,7 @@ function GoalSidebar(props: { api: TuiPluginApi; sessionID: string }) {
   const goal = createMemo(() => state().goal)
   const elapsed = createMemo(() => {
     const value = goal()
-    return value?.timeUsedSeconds ?? 0
+    return value ? liveTimeUsedSeconds(value, nowSeconds()) : 0
   })
   const objective = createMemo(() => {
     const value = goal()?.objective ?? ""

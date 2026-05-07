@@ -1,5 +1,24 @@
 import { expect, test } from "bun:test"
-import plugin from "../src/tui.tsx"
+import plugin, { liveTimeUsedSeconds } from "../src/tui.tsx"
+
+function goal(overrides: Partial<Parameters<typeof liveTimeUsedSeconds>[0]> = {}): Parameters<typeof liveTimeUsedSeconds>[0] {
+  return {
+    sessionID: "session",
+    objective: "test goal",
+    status: "active",
+    tokenBudget: null,
+    tokensUsed: 0,
+    timeUsedSeconds: 10,
+    createdAt: 90,
+    updatedAt: 100,
+    completionEvidence: null,
+    blocker: null,
+    closedAt: null,
+    remainingTokens: null,
+    sampledAt: 100,
+    ...overrides,
+  }
+}
 
 test("tui plugin registers goal sidebar and status command without hijacking /goal", async () => {
   let registered: (() => { value: string; slash?: { name: string } }[]) | undefined
@@ -46,4 +65,11 @@ test("tui plugin registers goal sidebar and status command without hijacking /go
   expect(commands.map((command) => command.value).sort()).toEqual(["goal.show"])
   expect(commands.flatMap((command) => (command.slash ? [command.slash.name] : [])).sort()).toEqual([])
   expect(typeof sidebar?.({}, { session_id: "session" })).not.toBe("string")
+})
+
+test("live goal time advances from the authoritative snapshot sample time", () => {
+  expect(liveTimeUsedSeconds(goal(), 130)).toBe(40)
+  expect(liveTimeUsedSeconds(goal({ status: "paused" }), 130)).toBe(10)
+  expect(liveTimeUsedSeconds(goal({ status: "complete" }), 130)).toBe(10)
+  expect(liveTimeUsedSeconds(goal({ sampledAt: undefined }), 130)).toBe(10)
 })
