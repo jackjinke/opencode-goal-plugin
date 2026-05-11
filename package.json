@@ -36,7 +36,7 @@
   ],
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external zod",
+    "build": "bun run clean && bun build ./src/server.ts --outdir ./dist --target bun --external @opencode-ai/plugin --external effect --external zod",
     "ci:version": "bun scripts/resolve-ci-version.ts",
     "lint": "eslint .",
     "pack:dry-run": "npm pack --dry-run",
@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.14.39",
+    "effect": "^3.21.2",
     "zod": "^4.1.8"
   },
   "devDependencies": {

@@ -2,6 +2,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import { readFileSync } from "node:fs"
+import { Data, Effect, Schema } from "effect"
 
 export type GoalStatus = "active" | "paused" | "budgetLimited" | "complete" | "unmet"
 export type MutableGoalStatus = "active" | "paused"
@@ -28,6 +29,41 @@ type State = {
   goals: Record<string, Goal>
 }
 
+class StateReadError extends Data.TaggedError("StateReadError")<{
+  readonly cause: unknown
+}> {}
+
+class StateDecodeError extends Data.TaggedError("StateDecodeError")<{
+  readonly cause: unknown
+}> {}
+
+class StateWriteError extends Data.TaggedError("StateWriteError")<{
+  readonly cause: unknown
+}> {}
+
+const NullableString = Schema.NullOr(Schema.String)
+const NullableNumber = Schema.NullOr(Schema.Number)
+const GoalSchema = Schema.Struct({
+  sessionID: Schema.String,
+  objective: Schema.String,
+  status: Schema.Literal("active", "paused", "budgetLimited", "complete", "unmet"),
+  tokenBudget: NullableNumber,
+  tokensUsed: Schema.Number,
+  timeUsedSeconds: Schema.Number,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+  completionEvidence: Schema.optionalWith(NullableString, { default: () => null }),
+  blocker: Schema.optionalWith(NullableString, { default: () => null }),
+  closedAt: Schema.optionalWith(NullableNumber, { default: () => null }),
+  lastAccountedAt: NullableNumber,
+  autoTurns: Schema.Number,
+  lastContinuationAt: NullableNumber,
+})
+const StateSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  goals: Schema.Record({ key: Schema.String, value: GoalSchema }),
+})
+
 export type GoalSnapshot = Omit<Goal, "lastAccountedAt" | "autoTurns" | "lastContinuationAt"> & {
   remainingTokens: number | null
   sampledAt: number
@@ -52,41 +88,91 @@ function emptyState(): State {
   return { version: 1, goals: {} }
 }
 
+function isMissingStateFile(error: unknown) {
+  return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "ENOENT"
+}
+
+function mutableState(state: Schema.Schema.Type<typeof StateSchema>): State {
+  return JSON.parse(JSON.stringify(state)) as State
+}
+
+function decodeState(value: unknown) {
+  return Schema.decodeUnknown(StateSchema)(value).pipe(
+    Effect.map(mutableState),
+    Effect.mapError((cause) => new StateDecodeError({ cause })),
+  )
+}
+
+function readStateEffect() {
+  return Effect.tryPromise({
+    try: () => readFile(statePath(), "utf8"),
+    catch: (cause) => new StateReadError({ cause }),
+  }).pipe(
+    Effect.flatMap((raw) =>
+      Effect.try({
+        try: () => JSON.parse(raw) as unknown,
+        catch: (cause) => new StateDecodeError({ cause }),
+      }),
+    ),
+    Effect.flatMap(decodeState),
+    Effect.catchAll((error) =>
+      error._tag === "StateReadError" && isMissingStateFile(error.cause) ? Effect.succeed(emptyState()) : Effect.fail(error),
+    ),
+  )
+}
+
+function writeStateEffect(state: State) {
+  return Effect.tryPromise({
+    try: async () => {
+      const file = statePath()
+      await mkdir(dirname(file), { recursive: true })
+      const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
+      await writeFile(tmp, JSON.stringify(state, null, 2) + "\n")
+      await rename(tmp, file)
+    },
+    catch: (cause) => new StateWriteError({ cause }),
+  })
+}
+
 async function readState(): Promise<State> {
-  try {
-    const raw = await readFile(statePath(), "utf8")
-    const parsed = JSON.parse(raw) as State
-    return parsed && parsed.version === 1 && parsed.goals ? parsed : emptyState()
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState()
-    throw error
-  }
+  return Effect.runPromise(readStateEffect())
 }
 
 function readStateSync(): State {
   try {
     const raw = readFileSync(statePath(), "utf8")
-    const parsed = JSON.parse(raw) as State
-    return parsed && parsed.version === 1 && parsed.goals ? parsed : emptyState()
+    return mutableState(Schema.decodeUnknownSync(StateSchema)(JSON.parse(raw) as unknown))
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState()
+    if (isMissingStateFile(error)) return emptyState()
     throw error
   }
 }
 
-async function writeState(state: State) {
-  const file = statePath()
-  await mkdir(dirname(file), { recursive: true })
-  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-  await writeFile(tmp, JSON.stringify(state, null, 2) + "\n")
-  await rename(tmp, file)
+let mutationQueue: Promise<void> = Promise.resolve()
+
+function enqueueMutation<T>(operation: () => Promise<T>) {
+  const current = mutationQueue.then(operation, operation)
+  mutationQueue = current.then(
+    () => undefined,
+    () => undefined,
+  )
+  return current
 }
 
 async function mutate<T>(fn: (state: State) => T | Promise<T>) {
-  const state = await readState()
-  const result = await fn(state)
-  await writeState(state)
-  return result
+  return enqueueMutation(() =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const state = yield* readStateEffect()
+        const result = yield* Effect.tryPromise({
+          try: () => Promise.resolve(fn(state)),
+          catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+        })
+        yield* writeStateEffect(state)
+        return result
+      }),
+    ),
+  )
 }
 
 export function validateObjective(objective: string) {

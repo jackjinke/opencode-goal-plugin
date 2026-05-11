@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -75,4 +75,34 @@ test("reserves continuation until max auto turns is reached", async () => {
   expect(await reserveContinuation("ses_1", 1, 0)).not.toBeNull()
   expect(await reserveContinuation("ses_1", 1, 0)).toBeNull()
   expect((await getGoal("ses_1"))?.status).toBe("active")
+})
+
+test("decodes persisted goal state with optional closure fields omitted", async () => {
+  await writeFile(
+    process.env.OPENCODE_GOAL_STATE_PATH!,
+    JSON.stringify({
+      version: 1,
+      goals: {
+        ses_1: {
+          sessionID: "ses_1",
+          objective: "continue",
+          status: "active",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          createdAt: 1,
+          updatedAt: 1,
+          lastAccountedAt: 1,
+          autoTurns: 0,
+          lastContinuationAt: null,
+        },
+      },
+    }),
+  )
+
+  const goal = await getGoal("ses_1")
+
+  expect(goal?.completionEvidence).toBeNull()
+  expect(goal?.blocker).toBeNull()
+  expect(goal?.closedAt).toBeNull()
 })
