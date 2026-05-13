@@ -111,7 +111,7 @@ function sessionIDOrToast(api: TuiPluginApi) {
   return sessionID
 }
 
-function formatDuration(seconds: number) {
+export function formatDuration(seconds: number) {
   const total = Math.max(0, Math.floor(seconds))
   const hours = Math.floor(total / 3600)
   const minutes = Math.floor((total % 3600) / 60)
@@ -202,7 +202,7 @@ function formatGoal(goal: GoalSnapshot | null) {
   const lines = [
     `Objective: ${goal.objective}`,
     `Status: ${visibleStatus(goal.status)}`,
-    `Time used: ${goal.timeUsedSeconds}s`,
+    `Time used: ${formatDuration(goal.timeUsedSeconds)}`,
   ]
   if (goal.completionEvidence) lines.push(`Completion evidence: ${goal.completionEvidence}`)
   if (goal.blocker) lines.push(`Blocker: ${goal.blocker}`)
@@ -223,10 +223,7 @@ function GoalSidebar(props: { api: TuiPluginApi; sessionID: string }) {
     const value = goal()
     return value ? liveTimeUsedSeconds(value, nowSeconds()) : 0
   })
-  const objective = createMemo(() => {
-    const value = goal()?.objective ?? ""
-    return value.length > 72 ? `${value.slice(0, 69)}...` : value
-  })
+  const objective = createMemo(() => goal()?.objective ?? "")
 
   return (
     <Show when={goal()}>

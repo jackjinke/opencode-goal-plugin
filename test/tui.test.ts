@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import plugin, { liveTimeUsedSeconds } from "../src/tui.tsx"
+import plugin, { formatDuration, liveTimeUsedSeconds } from "../src/tui.tsx"
 
 function goal(overrides: Partial<Parameters<typeof liveTimeUsedSeconds>[0]> = {}): Parameters<typeof liveTimeUsedSeconds>[0] {
   return {
@@ -72,4 +72,11 @@ test("live goal time advances from the authoritative snapshot sample time", () =
   expect(liveTimeUsedSeconds(goal({ status: "paused" }), 130)).toBe(10)
   expect(liveTimeUsedSeconds(goal({ status: "complete" }), 130)).toBe(10)
   expect(liveTimeUsedSeconds(goal({ sampledAt: undefined }), 130)).toBe(10)
+})
+
+test("formats goal durations for display", () => {
+  expect(formatDuration(0)).toBe("0:00")
+  expect(formatDuration(65)).toBe("1:05")
+  expect(formatDuration(74305)).toBe("20:38:25")
+  expect(formatDuration(-1)).toBe("0:00")
 })
