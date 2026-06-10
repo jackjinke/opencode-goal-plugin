@@ -18,10 +18,10 @@ The OpenCode Goal Plugin adds:
 
 - `/goal <objective>` as an OpenCode command for TUI, desktop, and web.
 - A sidebar goal indicator with status, elapsed time, and objective.
-- Agent tools: `get_goal`, `create_goal`, `set_goal`, `update_goal`, and `clear_goal`.
+- Agent tools: `get_goal`, `get_goal_history`, `create_goal`, `set_goal`, `update_goal_objective`, `update_goal`, and `clear_goal`.
 - Goal close evidence: `complete` requires verified evidence, and `unmet` requires a concrete blocker.
-- Persistent per-session goal state.
-- Optional automatic continuation on `session.idle`.
+- Persistent per-session goal state with history, checkpoints, budgets, and owner-only file permissions.
+- Optional automatic continuation on `session.idle` / `session.status`, with no-progress pause and budget wrap-up safeguards.
 - Compaction context so active goals are preserved when OpenCode summarizes a long session.
 
 ## Why Use This OpenCode Goal Plugin?
@@ -84,7 +84,11 @@ Server options can be configured in `opencode.json`:
         "auto_continue": true,
         "max_auto_turns": 25,
         "min_continue_interval_seconds": 3,
-        "max_prompt_failures": 3
+        "max_prompt_failures": 3,
+        "default_token_budget": 200000,
+        "max_goal_duration_seconds": 1800,
+        "no_progress_token_threshold": 50,
+        "max_no_progress_turns": 2
       }
     ]
   ]
@@ -97,6 +101,10 @@ Defaults:
 - `max_auto_turns`: `25`
 - `min_continue_interval_seconds`: `3`
 - `max_prompt_failures`: `3`
+- `default_token_budget`: unset by default; when set, new goals inherit this token budget.
+- `max_goal_duration_seconds`: unset by default; when set, new goals inherit this elapsed-time safety limit.
+- `no_progress_token_threshold`: `50`
+- `max_no_progress_turns`: `2`
 - `register_command`: `true`
 - `command_name`: `"goal"`
 
@@ -108,7 +116,7 @@ Use `/goal <objective>` in a fresh OpenCode chat to create a long-running goal:
 /goal review the frontend and translate visible English UI text to Spanish
 ```
 
-Bare `/goal` reports the current goal state. `/goal pause` pauses the goal without clearing it, and `/goal resume` resumes it. `/goal clear` clears the goal; `/goal stop`, `/goal off`, `/goal reset`, `/goal none`, and `/goal cancel` are clear aliases. The TUI also includes a `Goal` command-palette entry for viewing, refreshing, or clearing the current goal state without creating a new goal.
+Bare `/goal` reports the current goal state. `/goal history` reports lifecycle history and recent checkpoints. `/goal edit <objective>` updates the current objective. `/goal pause` pauses the goal without clearing it, and `/goal resume` resumes it. `/goal clear` clears the goal; `/goal stop`, `/goal off`, `/goal reset`, `/goal none`, and `/goal cancel` are clear aliases. The TUI also includes a `Goal` command-palette entry for viewing, refreshing, pausing, resuming, showing history, or clearing the current goal state without creating a new goal.
 
 You can also ask the agent to formulate the objective and call `set_goal` itself, for example: "set your own goal to finish this refactor safely." The tool uses the agent-written objective but still only creates a goal when explicitly requested.
 
@@ -118,6 +126,14 @@ The `update_goal` tool can close a goal in two ways:
 
 - `status: "complete"` with `evidence` when every requirement is actually achieved.
 - `status: "unmet"` with `blocker` when the objective cannot be achieved or is blocked by missing external input.
+
+The plugin also uses safety states while keeping the goal available for review or resume:
+
+- `budgetLimited` when a token budget is exhausted.
+- `usageLimited` when an auto-turn or elapsed-time budget is exhausted.
+- `paused` when the user pauses, auto-continue repeatedly fails, or repeated low-output/no-progress turns are detected.
+
+When a safety limit is reached, the plugin sends one wrap-up prompt asking for a concise handoff instead of silently continuing forever.
 
 ## State
 
@@ -134,6 +150,12 @@ If `XDG_DATA_HOME` is not set, the default is:
 ```
 
 Set `OPENCODE_GOAL_STATE_PATH` to use a custom file.
+
+The state file is written atomically with owner-only permissions when the host filesystem supports it. Existing active goals recover from disk with their full objective, budget, history, and checkpoint metadata.
+
+## Credits
+
+This plugin follows Codex's native goal-mode semantics where OpenCode plugin hooks allow it. Several hardening ideas were adapted from Willy Topete's [`willytop8/OpenCode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin), especially lifecycle history, checkpoints, no-progress safeguards, budget wrap-up behavior, and strict-provider-safe system prompt merging. Thank you, Willy.
 
 ## Development
 
@@ -172,6 +194,6 @@ OpenCode plugin modules are target-specific. This package exports separate modul
 }
 ```
 
-Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications.
+Codex goal mode has deeper runtime integration for thread lifecycle control. This plugin implements the same workflow using OpenCode plugin hooks. Token usage is read from OpenCode step-finish usage when available and falls back to message token metadata or text estimation when exact usage is unavailable. Continuation is driven by OpenCode idle events, including `session.idle` and `session.status` idle notifications. During compaction, the plugin disables OpenCode's generic synthetic auto-continue while an active goal exists so the goal-specific continuation prompt remains authoritative.
 
-The goal sidebar shows the current status, elapsed time, auto-continue count, latest status message, and objective when a goal is active or paused. Closed goals remain visible briefly through the latest tool state as achieved or unmet.
+The goal sidebar shows the current status, elapsed time, token usage, auto-continue count, latest checkpoint, latest status message, stop reason, and objective when a goal is active, paused, or safety-limited. Closed goals remain visible briefly through the latest tool state as achieved or unmet.

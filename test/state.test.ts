@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
@@ -7,6 +7,7 @@ import {
   clearGoal,
   completeGoal,
   createGoal,
+  recordAssistantProgress,
   getGoal,
   markGoalUnmet,
   reserveContinuation,
@@ -28,8 +29,8 @@ afterEach(async () => {
 test("creates, reads, pauses, resumes, completes, and clears a goal", async () => {
   const created = await createGoal("ses_1", "ship the plugin", 100)
   expect(created.status).toBe("active")
-  expect(created.tokenBudget).toBeNull()
-  expect(created.remainingTokens).toBeNull()
+  expect(created.tokenBudget).toBe(100)
+  expect(created.remainingTokens).toBe(100)
   expect(created.sampledAt).toBeGreaterThanOrEqual(created.createdAt)
 
   await accountUsage("ses_1", 40)
@@ -62,19 +63,37 @@ test("requires evidence when closing goals", async () => {
   await expect(markGoalUnmet("ses_1", "")).rejects.toThrow("blocker must not be empty")
 })
 
-test("token usage is informational and does not limit goals", async () => {
+test("token usage marks goals budget limited", async () => {
   await createGoal("ses_1", "stay active", 10)
   const updated = await accountUsage("ses_1", 12)
-  expect(updated?.status).toBe("active")
-  expect(updated?.remainingTokens).toBeNull()
+  expect(updated?.status).toBe("budgetLimited")
+  expect(updated?.remainingTokens).toBe(0)
   expect(updated?.tokensUsed).toBe(12)
+  expect(updated?.stopReason).toContain("token budget reached")
 })
 
 test("reserves continuation until max auto turns is reached", async () => {
   await createGoal("ses_1", "continue", null)
   expect(await reserveContinuation("ses_1", 1, 0)).not.toBeNull()
+  const limited = await reserveContinuation("ses_1", 1, 0)
+  expect(limited?.status).toBe("usageLimited")
+  expect(limited?.budgetWrapupSent).toBe(true)
   expect(await reserveContinuation("ses_1", 1, 0)).toBeNull()
-  expect((await getGoal("ses_1"))?.status).toBe("active")
+  expect((await getGoal("ses_1"))?.status).toBe("usageLimited")
+})
+
+test("records assistant checkpoints and pauses after repeated no-progress turns", async () => {
+  await createGoal("ses_1", "continue", { noProgressTokenThreshold: 50, maxNoProgressTurns: 2 })
+  const first = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
+  expect(first?.lastCheckpoint?.summary).toBe("Inspected the repo")
+  expect(first?.status).toBe("active")
+
+  await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
+  const paused = await recordAssistantProgress("ses_1", { messageID: "m1", text: "Inspected the repo", outputTokens: 10 })
+
+  expect(paused?.status).toBe("paused")
+  expect(paused?.stopReason).toBe("no progress")
+  expect(paused?.history.some((entry) => entry.type === "checkpoint")).toBe(true)
 })
 
 test("decodes persisted goal state with optional closure fields omitted", async () => {
@@ -105,4 +124,20 @@ test("decodes persisted goal state with optional closure fields omitted", async 
   expect(goal?.completionEvidence).toBeNull()
   expect(goal?.blocker).toBeNull()
   expect(goal?.closedAt).toBeNull()
+})
+
+test("writes state with owner-only file permissions", async () => {
+  await createGoal("ses_1", "ship the plugin", null)
+
+  const mode = (await stat(process.env.OPENCODE_GOAL_STATE_PATH!)).mode & 0o777
+
+  expect(mode).toBe(0o600)
+})
+
+test("does not overwrite corrupt persisted state", async () => {
+  await writeFile(process.env.OPENCODE_GOAL_STATE_PATH!, "{not valid json", "utf8")
+
+  await expect(createGoal("ses_1", "ship the plugin", null)).rejects.toThrow()
+
+  expect(await readFile(process.env.OPENCODE_GOAL_STATE_PATH!, "utf8")).toBe("{not valid json")
 })

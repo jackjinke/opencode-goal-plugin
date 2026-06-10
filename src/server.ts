@@ -6,13 +6,16 @@ import {
   completeGoal,
   createGoal,
   estimateTokensFromText,
+  formatGoalHistory,
   getGoal,
   markGoalUnmet,
+  recordAssistantProgress,
   recordContinuationResult,
   reserveContinuation,
   setGoalStatus,
+  updateGoalObjective,
 } from "./state"
-import { compactionContext, continuationPrompt, systemReminder } from "./prompts"
+import { compactionContext, continuationPrompt, limitPrompt, systemReminder } from "./prompts"
 
 type Options = {
   auto_continue?: boolean
@@ -21,10 +24,17 @@ type Options = {
   max_prompt_failures?: number
   register_command?: boolean
   command_name?: string
+  default_token_budget?: number
+  max_goal_duration_seconds?: number
+  no_progress_token_threshold?: number
+  max_no_progress_turns?: number
 }
 
 type CreateGoalArgs = {
   objective: string
+  token_budget?: number | null
+  max_auto_turns?: number | null
+  max_duration_seconds?: number | null
 }
 
 type UpdateGoalArgs =
@@ -43,6 +53,7 @@ const DEFAULT_MAX_AUTO_TURNS = 25
 const DEFAULT_CONTINUE_INTERVAL_SECONDS = 3
 const DEFAULT_MAX_PROMPT_FAILURES = 3
 const DEFAULT_COMMAND_NAME = "goal"
+const GOAL_SYSTEM_MARKER = "OpenCode goal mode"
 const activeContinuations = new Set<string>()
 
 function goalCommandTemplate(commandName: string) {
@@ -57,12 +68,14 @@ Use the goal tools to handle this command:
 
 - If the arguments are empty, call get_goal and briefly report the current goal state.
 - If the arguments are "status", "show", or "current", call get_goal and briefly report the current goal state.
+- If the arguments are "history", call get_goal_history and briefly report the current goal history.
 - If the arguments are "clear", "stop", "off", "reset", "none", or "cancel", call clear_goal and report whether a goal was cleared.
 - If the arguments are "pause", pause the current goal by calling update_goal_status with status "paused" and report the result.
 - If the arguments are "resume", resume the current goal by calling update_goal_status with status "active" and continue working toward it.
+- If the arguments start with "edit ", update the current goal objective by calling update_goal_objective with the remaining text.
 - If the arguments start with "complete " or "done ", perform a completion audit against real artifacts and command output. Call update_goal with status "complete" only if the goal is achieved, using concise evidence from the audit.
 - If the arguments start with "unmet ", "blocked ", or "blocker ", call update_goal with status "unmet" only when the goal cannot be achieved or needs external input, using the remaining arguments as the blocker.
-- Otherwise, create a new goal with create_goal. Use the full arguments as the objective.
+- Otherwise, create a new goal with create_goal. Use the full arguments as the objective. If the user includes explicit budget instructions, pass token_budget, max_auto_turns, or max_duration_seconds to create_goal rather than leaving those words in the objective.
 
 Create a goal only from these explicit command arguments. Do not infer a goal from unrelated session context. After create_goal succeeds, continue working toward the new goal.`
 }
@@ -71,6 +84,10 @@ function commandNameFromOptions(options?: Options) {
   const name = options?.command_name?.trim() || DEFAULT_COMMAND_NAME
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) return DEFAULT_COMMAND_NAME
   return name
+}
+
+function positiveIntegerOrNull(value: unknown) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
 function registerDesktopCommand(config: Config, commandName: string) {
@@ -90,13 +107,12 @@ function textFromPart(part: unknown): string {
   return ""
 }
 
+function textFromMessage(message: { parts?: unknown[] }) {
+  return (message.parts ?? []).map(textFromPart).filter(Boolean).join("\n").trim()
+}
+
 function estimateMessages(messages: { parts?: unknown[] }[]) {
-  return messages.reduce<number>((sum, message) => {
-    return (
-      sum +
-      (message.parts ?? []).reduce<number>((partSum, part) => partSum + estimateTokensFromText(textFromPart(part)), 0)
-    )
-  }, 0)
+  return messages.reduce<number>((sum, message) => sum + estimateTokensFromText(textFromMessage(message)), 0)
 }
 
 function tokensFromRecord(value: unknown): number | undefined {
@@ -109,6 +125,12 @@ function tokensFromRecord(value: unknown): number | undefined {
   return fields.reduce<number>((sum, field) => sum + (typeof field === "number" && Number.isFinite(field) ? field : 0), 0)
 }
 
+function outputTokensFromRecord(value: unknown): number | undefined {
+  if (!value || typeof value !== "object") return undefined
+  const output = (value as Record<string, unknown>).output
+  return typeof output === "number" && Number.isFinite(output) ? output : undefined
+}
+
 function exactTokensFromPart(part: unknown): number | undefined {
   if (!part || typeof part !== "object") return undefined
   const value = part as Record<string, unknown>
@@ -119,9 +141,18 @@ function exactTokensFromPart(part: unknown): number | undefined {
 function exactTokensFromMessage(message: { info?: unknown; parts?: unknown[] }) {
   const partTotal = (message.parts ?? []).reduce<number>((sum, part) => sum + (exactTokensFromPart(part) ?? 0), 0)
   if (partTotal > 0) return partTotal
-  if (message.info && typeof message.info === "object") {
-    return tokensFromRecord((message.info as Record<string, unknown>).tokens)
+  if (message.info && typeof message.info === "object") return tokensFromRecord((message.info as Record<string, unknown>).tokens)
+  return undefined
+}
+
+function outputTokensFromMessage(message: { info?: unknown; parts?: unknown[] }) {
+  for (const part of message.parts ?? []) {
+    if (part && typeof part === "object" && (part as Record<string, unknown>).type === "step-finish") {
+      const output = outputTokensFromRecord((part as Record<string, unknown>).tokens)
+      if (output != null) return output
+    }
   }
+  if (message.info && typeof message.info === "object") return outputTokensFromRecord((message.info as Record<string, unknown>).tokens)
   return undefined
 }
 
@@ -142,12 +173,7 @@ async function sendContinuation(client: Parameters<Plugin>[0]["client"], session
 function isIdleEvent(event: { type?: string; properties?: Record<string, unknown> }) {
   if (event.type === "session.idle") return true
   const status = event.properties?.status
-  return (
-    event.type === "session.status" &&
-    typeof status === "object" &&
-    status !== null &&
-    (status as { type?: unknown }).type === "idle"
-  )
+  return event.type === "session.status" && typeof status === "object" && status !== null && (status as { type?: unknown }).type === "idle"
 }
 
 function sessionIDFromEvent(event: { properties?: Record<string, unknown> }) {
@@ -160,11 +186,66 @@ function sessionIDFromEvent(event: { properties?: Record<string, unknown> }) {
   return undefined
 }
 
+function messageID(message: { info?: unknown; id?: unknown }) {
+  if (typeof message.id === "string") return message.id
+  if (message.info && typeof message.info === "object" && typeof (message.info as { id?: unknown }).id === "string") {
+    return (message.info as { id: string }).id
+  }
+  return undefined
+}
+
+function messageRole(message: { info?: unknown; role?: unknown }) {
+  if (typeof message.role === "string") return message.role
+  if (message.info && typeof message.info === "object" && typeof (message.info as { role?: unknown }).role === "string") {
+    return (message.info as { role: string }).role
+  }
+  return undefined
+}
+
+function latestAssistantMessage(messages: { info?: unknown; role?: unknown; id?: unknown; parts?: unknown[] }[]) {
+  return [...messages].reverse().find((message) => messageRole(message) === "assistant")
+}
+
+async function fetchLatestAssistant(client: Parameters<Plugin>[0]["client"], sessionID: string) {
+  const session = client.session as unknown as {
+    messages?: (input: { path: { id: string }; query: { limit: number } }) => Promise<{ data?: unknown[] }>
+  }
+  if (!session.messages) return undefined
+  const result = await session.messages({ path: { id: sessionID }, query: { limit: 20 } })
+  const data = Array.isArray(result.data) ? result.data : []
+  return latestAssistantMessage(data as { info?: unknown; role?: unknown; id?: unknown; parts?: unknown[] }[])
+}
+
+async function recordAssistantMessage(
+  sessionID: string,
+  message: { info?: unknown; role?: unknown; id?: unknown; parts?: unknown[] } | undefined,
+  options: Options,
+) {
+  if (!message) return
+  await recordAssistantProgress(sessionID, {
+    messageID: messageID(message),
+    text: textFromMessage(message),
+    outputTokens: outputTokensFromMessage(message) ?? null,
+    noProgressTokenThreshold: positiveIntegerOrNull(options.no_progress_token_threshold),
+    maxNoProgressTurns: positiveIntegerOrNull(options.max_no_progress_turns),
+  })
+}
+
+function mergeSystemReminder(output: { system: string[] }, reminder: string) {
+  if (!reminder.trim()) return
+  if (output.system.some((block) => block.includes(GOAL_SYSTEM_MARKER))) return
+  if (output.system.length === 0) {
+    output.system.push(reminder)
+    return
+  }
+  output.system[0] = `${output.system[0]}\n\n${reminder}`
+}
+
 const server: Plugin = async ({ client }, options?: Options) => {
   const autoContinue = options?.auto_continue ?? true
-  const maxAutoTurns = options?.max_auto_turns ?? DEFAULT_MAX_AUTO_TURNS
-  const minInterval = options?.min_continue_interval_seconds ?? DEFAULT_CONTINUE_INTERVAL_SECONDS
-  const maxPromptFailures = options?.max_prompt_failures ?? DEFAULT_MAX_PROMPT_FAILURES
+  const maxAutoTurns = positiveIntegerOrNull(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS
+  const minInterval = positiveIntegerOrNull(options?.min_continue_interval_seconds) ?? DEFAULT_CONTINUE_INTERVAL_SECONDS
+  const maxPromptFailures = positiveIntegerOrNull(options?.max_prompt_failures) ?? DEFAULT_MAX_PROMPT_FAILURES
   const registerCommand = options?.register_command ?? true
   const commandName = commandNameFromOptions(options)
 
@@ -176,10 +257,18 @@ const server: Plugin = async ({ client }, options?: Options) => {
     tool: {
       get_goal: {
         description:
-          "Get the current goal for this OpenCode session, including status, observed token usage, and elapsed-time usage.",
+          "Get the current goal for this OpenCode session, including status, observed token usage, elapsed-time usage, budgets, checkpoints, and history.",
         args: {},
         async execute(_args, context) {
           return JSON.stringify({ goal: await getGoal(context.sessionID) }, null, 2)
+        },
+      },
+      get_goal_history: {
+        description: "Get the current goal lifecycle history and recent checkpoints for this OpenCode session.",
+        args: {},
+        async execute(_args, context) {
+          const goal = await getGoal(context.sessionID)
+          return JSON.stringify({ goal, history_report: formatGoalHistory(goal) }, null, 2)
         },
       },
       create_goal: {
@@ -187,10 +276,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
           "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks. Fails if a non-complete goal exists.",
         args: {
           objective: z.string().min(1).max(4000).describe("The concrete objective to start pursuing."),
+          token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
+          max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
+          max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
         },
         async execute(args, context) {
           const input = args as CreateGoalArgs
-          const goal = await createGoal(context.sessionID, input.objective)
+          const goal = await createGoal(context.sessionID, input.objective, {
+            tokenBudget: input.token_budget ?? options?.default_token_budget ?? null,
+            maxAutoTurns: input.max_auto_turns ?? null,
+            maxDurationSeconds: input.max_duration_seconds ?? options?.max_goal_duration_seconds ?? null,
+            noProgressTokenThreshold: options?.no_progress_token_threshold ?? null,
+            maxNoProgressTurns: options?.max_no_progress_turns ?? null,
+          })
           return JSON.stringify({ goal }, null, 2)
         },
       },
@@ -199,10 +297,31 @@ const server: Plugin = async ({ client }, options?: Options) => {
           "Set a new goal when the user explicitly asks the agent to formulate and set its own goal. The model should write the objective itself based on the user's explicit request. Fails if a non-complete goal exists.",
         args: {
           objective: z.string().min(1).max(4000).describe("The model-formulated concrete objective to start pursuing."),
+          token_budget: z.number().int().positive().nullable().optional().describe("Optional positive token budget."),
+          max_auto_turns: z.number().int().positive().nullable().optional().describe("Optional per-goal auto-continue limit."),
+          max_duration_seconds: z.number().int().positive().nullable().optional().describe("Optional per-goal duration limit."),
         },
         async execute(args, context) {
           const input = args as CreateGoalArgs
-          const goal = await createGoal(context.sessionID, input.objective)
+          const goal = await createGoal(context.sessionID, input.objective, {
+            tokenBudget: input.token_budget ?? options?.default_token_budget ?? null,
+            maxAutoTurns: input.max_auto_turns ?? null,
+            maxDurationSeconds: input.max_duration_seconds ?? options?.max_goal_duration_seconds ?? null,
+            noProgressTokenThreshold: options?.no_progress_token_threshold ?? null,
+            maxNoProgressTurns: options?.max_no_progress_turns ?? null,
+          })
+          return JSON.stringify({ goal }, null, 2)
+        },
+      },
+      update_goal_objective: {
+        description: "Edit the current OpenCode goal objective when the user explicitly asks to edit or replace it.",
+        args: {
+          objective: z.string().min(1).max(4000).describe("The updated concrete objective."),
+          status: z.enum(["active", "paused"]).optional().describe("Whether the edited goal should be active or paused."),
+        },
+        async execute(args, context) {
+          const input = args as { objective: string; status?: "active" | "paused" }
+          const goal = await updateGoalObjective(context.sessionID, input.objective, input.status ?? "active")
           return JSON.stringify({ goal }, null, 2)
         },
       },
@@ -228,7 +347,8 @@ const server: Plugin = async ({ client }, options?: Options) => {
           const input = args as UpdateGoalArgs
           if (input.status === "complete") {
             const goal = await completeGoal(context.sessionID, input.evidence ?? "")
-            const report = `Goal achieved. Time used: ${goal.timeUsedSeconds} seconds. Evidence: ${goal.completionEvidence}.`
+            const budget = goal.tokenBudget == null ? "" : ` Token usage: ${goal.tokensUsed}/${goal.tokenBudget}.`
+            const report = `Goal achieved. Time used: ${goal.timeUsedSeconds} seconds.${budget} Evidence: ${goal.completionEvidence}.`
             return JSON.stringify({ goal, completion_report: report }, null, 2)
           }
           const goal = await markGoalUnmet(context.sessionID, input.blocker ?? "")
@@ -262,26 +382,40 @@ const server: Plugin = async ({ client }, options?: Options) => {
           : output.messages.find((message) => typeof message.info.sessionID === "string")?.info.sessionID
       if (!sessionID) return
       await accountUsage(sessionID, tokensFromMessages(output.messages))
+      await recordAssistantMessage(sessionID, latestAssistantMessage(output.messages), options ?? {})
     },
     async "experimental.chat.system.transform"(input, output) {
       if (typeof input.sessionID !== "string") return
-      output.system.push(systemReminder(await getGoal(input.sessionID)))
+      mergeSystemReminder(output, systemReminder(await getGoal(input.sessionID)))
     },
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID)
       if (!goal) return
       output.context.push(compactionContext(goal))
     },
+    async "experimental.compaction.autocontinue"(input, output) {
+      const goal = await getGoal(input.sessionID)
+      if (goal?.status === "active") output.enabled = false
+    },
     async event({ event }) {
-      if (!autoContinue || !isIdleEvent(event as never)) return
       const sessionID = sessionIDFromEvent(event as never)
+      if (sessionID && (event as { type?: string }).type === "message.updated") {
+        const props = (event as { properties?: Record<string, unknown> }).properties ?? {}
+        const message = [props.info, props.message].find((value) => value && typeof value === "object") as
+          | { info?: unknown; role?: unknown; id?: unknown; parts?: unknown[] }
+          | undefined
+        await recordAssistantMessage(sessionID, message, options ?? {})
+      }
+
+      if (!autoContinue || !isIdleEvent(event as never)) return
       if (!sessionID) return
       if (activeContinuations.has(sessionID)) return
       activeContinuations.add(sessionID)
       try {
+        await recordAssistantMessage(sessionID, await fetchLatestAssistant(client, sessionID), options ?? {})
         const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval)
         if (!goal) return
-        await sendContinuation(client, sessionID, continuationPrompt(goal))
+        await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal))
         await recordContinuationResult(sessionID, "success", maxPromptFailures)
       } catch (error) {
         await recordContinuationResult(sessionID, "failure", maxPromptFailures)

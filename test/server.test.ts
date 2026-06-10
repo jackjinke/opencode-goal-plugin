@@ -43,8 +43,10 @@ test("server plugin exposes Codex-style goal tools", async () => {
     "clear_goal",
     "create_goal",
     "get_goal",
+    "get_goal_history",
     "set_goal",
     "update_goal",
+    "update_goal_objective",
     "update_goal_status",
   ])
 
@@ -110,7 +112,83 @@ test("server plugin registers goal as a desktop/web command by default", async (
   expect(config.command?.goal?.template).toContain("$ARGUMENTS")
   expect(config.command?.goal?.template).toContain('"pause"')
   expect(config.command?.goal?.template).toContain('"resume"')
-  expect(config.command?.goal?.template).not.toContain("token_budget")
+  expect(config.command?.goal?.template).toContain("token_budget")
+  expect(config.command?.goal?.template).toContain('"history"')
+  expect(config.command?.goal?.template).toContain('"edit "')
+})
+
+test("system transform merges goal context into the primary system block idempotently", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, { sessionID: "ses_1" } as never)
+  const output = { system: ["Base system prompt"] }
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.system).toHaveLength(1)
+  expect(output.system[0]).toStartWith("Base system prompt")
+  expect(output.system[0]).toContain("OpenCode goal mode")
+  expect(output.system[0]?.match(/OpenCode goal mode/g)?.length).toBe(1)
+})
+
+test("compaction autocontinue is disabled while a goal is active", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, { sessionID: "ses_1" } as never)
+  const output = { enabled: true }
+  await hooks["experimental.compaction.autocontinue"]!({ sessionID: "ses_1" } as never, output)
+
+  expect(output.enabled).toBe(false)
+})
+
+test("goal objective can be edited and history can be reported", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+  const context = { sessionID: "ses_1" } as never
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, context)
+  const edited = await requireTool(tools.update_goal_objective, "update_goal_objective").execute(
+    { objective: "finish safely", status: "paused" },
+    context,
+  )
+  const history = await requireTool(tools.get_goal_history, "get_goal_history").execute({}, context)
+
+  expect(String(edited)).toContain("finish safely")
+  expect(String(edited)).toContain('"status": "paused"')
+  expect(String(history)).toContain("history_report")
+  expect(String(history)).toContain("updated")
 })
 
 test("goal status tool pauses and resumes a goal", async () => {
@@ -245,6 +323,38 @@ test("message transform prefers exact step token usage", async () => {
   const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
 
   expect(String(read)).toContain('"tokensUsed": 24')
+})
+
+test("message transform records assistant checkpoints", async () => {
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: false },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  const context = { sessionID: "ses_1" } as never
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "finish" }, context)
+  await hooks["experimental.chat.messages.transform"]!(
+    {},
+    {
+      messages: [
+        {
+          info: { id: "msg_1", role: "assistant", sessionID: "ses_1", tokens: { output: 100 } },
+          parts: [{ type: "text", text: "Inspected the repo and found the next step." }],
+        },
+      ],
+    } as never,
+  )
+
+  const read = await requireTool(tools.get_goal, "get_goal").execute({}, context)
+  expect(String(read)).toContain("Inspected the repo and found the next step")
 })
 
 test("compaction hook preserves active goal context", async () => {
