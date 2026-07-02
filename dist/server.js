@@ -1,5 +1,8 @@
 // @bun
 // src/server.ts
+import { appendFile as appendDebugLogFile, mkdir as makeDebugLogDir } from "fs/promises";
+import { homedir as userHomeDir } from "os";
+import { dirname as pathDirname, join as pathJoin } from "path";
 import { z } from "zod";
 
 // src/state.ts
@@ -705,6 +708,52 @@ var TASK_SETTLE_DELAY_MS = 25;
 var SNAPSHOT_IDLE_HOLD_MS = 250;
 var TASK_TERMINAL_STATES = new Set(["completed", "error", "cancelled"]);
 var activeContinuations = new Set;
+var DIAG_SERVICE = "opencode-goal-plugin";
+var continuationDiagEnabled = false;
+function defaultDebugLogDir() {
+  const dataHome = process.env.XDG_DATA_HOME || (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : pathJoin(userHomeDir(), ".local", "share"));
+  return pathJoin(dataHome, "opencode-goal-plugin", "debug-log");
+}
+function debugLogDir() {
+  return process.env.OPENCODE_GOAL_DEBUG_LOG_DIR || defaultDebugLogDir();
+}
+function safeDebugLogSessionID(value) {
+  if (typeof value !== "string" || value.length === 0)
+    return "_global";
+  const safe = value.replace(/[^A-Za-z0-9._-]/g, "_");
+  return safe || "_global";
+}
+function debugLogPath(extra) {
+  return pathJoin(debugLogDir(), `${safeDebugLogSessionID(extra.sessionID)}.jsonl`);
+}
+function sanitizeDiagValue(value) {
+  if (value instanceof Error)
+    return { name: value.name, message: value.message, stack: value.stack };
+  if (typeof value === "bigint")
+    return value.toString();
+  if (value == null || typeof value !== "object")
+    return value;
+  if (Array.isArray(value))
+    return value.map(sanitizeDiagValue);
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, sanitizeDiagValue(entry)]));
+}
+async function writeContinuationDiag(event, extra = {}) {
+  if (!continuationDiagEnabled)
+    return;
+  const file = debugLogPath(extra);
+  const sanitized = sanitizeDiagValue(extra);
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    service: DIAG_SERVICE,
+    event,
+    ...sanitized
+  }) + `
+`;
+  try {
+    await makeDebugLogDir(pathDirname(file), { recursive: true, mode: 448 });
+    await appendDebugLogFile(file, line, { mode: 384 });
+  } catch {}
+}
 function goalCommandTemplate(commandName) {
   return `OpenCode goal mode command "/${commandName}" was invoked.
 
@@ -926,14 +975,17 @@ class TaskTracker {
   pendingTaskCalls = new Map;
   latestAssistantBySession = new Map;
   snapshotIdleHolds = new Map;
+  missingStatusHolds = new Map;
   settledSnapshotIdleTasks = new Set;
   noteTaskCall(input) {
     if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task")
       return;
     if (typeof input.sessionID !== "string")
       return;
-    if (typeof input.callID === "string")
+    if (typeof input.callID === "string") {
       this.pendingTaskCalls.set(input.callID, input.sessionID);
+      writeContinuationDiag("task.call", { sessionID: input.sessionID, callID: input.callID });
+    }
   }
   noteTaskOutput(input, output) {
     if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task")
@@ -944,8 +996,15 @@ class TaskTracker {
     if (typeof parentSessionID !== "string")
       return;
     const status = parseTaskStatus(output.output);
-    if (!status)
+    if (!status) {
+      writeContinuationDiag("task.output.unparsed", {
+        sessionID: parentSessionID,
+        callID: input.callID,
+        outputPreview: typeof output.output === "string" ? output.output.slice(0, 500) : typeof output.output
+      });
       return;
+    }
+    writeContinuationDiag("task.output", { sessionID: parentSessionID, callID: input.callID, ...status });
     if (status.state === "running") {
       this.markRunning(parentSessionID, status.taskID);
       return;
@@ -956,12 +1015,14 @@ class TaskTracker {
     const info = event.properties?.info;
     if (!isRecord(info) || typeof info.id !== "string" || typeof info.parentID !== "string")
       return;
+    writeContinuationDiag("task.session.created", { sessionID: info.parentID, taskID: info.id });
     this.markRunning(info.parentID, info.id);
   }
   observeSessionStatus(sessionID, status) {
     const task = this.tasks.get(sessionID);
     if (!task)
       return;
+    writeContinuationDiag("task.session.status", { sessionID: task.parentSessionID, taskID: sessionID, status });
     if (status === "busy") {
       this.markRunning(task.parentSessionID, sessionID);
       return;
@@ -977,6 +1038,7 @@ class TaskTracker {
     }
     this.latestAssistantBySession.delete(sessionID);
     this.clearSnapshotIdleForSession(sessionID);
+    this.clearMissingStatusForSession(sessionID);
   }
   observeMessages(messages) {
     for (const message of messages) {
@@ -1006,6 +1068,7 @@ class TaskTracker {
   }
   hasBlockingTasks(parentSessionID) {
     this.pruneExpiredSnapshotIdleHolds();
+    this.pruneExpiredMissingStatusHolds();
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID)
         continue;
@@ -1016,12 +1079,44 @@ class TaskTracker {
       if (hold.parentSessionID === parentSessionID)
         return true;
     }
+    for (const hold of this.missingStatusHolds.values()) {
+      if (hold.parentSessionID === parentSessionID)
+        return true;
+    }
     return false;
+  }
+  blockingSummary(parentSessionID) {
+    this.pruneExpiredSnapshotIdleHolds();
+    this.pruneExpiredMissingStatusHolds();
+    const tasks = [...this.tasks.values()].filter((task) => task.parentSessionID === parentSessionID).map((task) => ({
+      taskID: task.taskID,
+      state: task.state,
+      terminalUnreconciled: task.terminalUnreconciled,
+      terminalAt: task.terminalAt,
+      lastAssistantMessageIDAtTerminal: task.lastAssistantMessageIDAtTerminal
+    }));
+    const holds = [...this.snapshotIdleHolds.values()].filter((hold) => hold.parentSessionID === parentSessionID).map((hold) => ({ taskID: hold.taskID, expiresAt: hold.expiresAt, remainingMs: Math.max(0, hold.expiresAt - Date.now()) }));
+    const missingStatusHolds = [...this.missingStatusHolds.values()].filter((hold) => hold.parentSessionID === parentSessionID).map((hold) => ({ taskID: hold.taskID, expiresAt: hold.expiresAt, remainingMs: Math.max(0, hold.expiresAt - Date.now()) }));
+    return {
+      tasks,
+      holds,
+      missingStatusHolds,
+      runningTasks: tasks.filter((task) => task.state === "running").length,
+      terminalUnreconciledTasks: tasks.filter((task) => task.terminalUnreconciled).length,
+      snapshotIdleHolds: holds.length,
+      missingStatusHoldCount: missingStatusHolds.length
+    };
   }
   nextSnapshotIdleRetryAt(parentSessionID) {
     this.pruneExpiredSnapshotIdleHolds();
+    this.pruneExpiredMissingStatusHolds();
     let next = null;
     for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID !== parentSessionID)
+        continue;
+      next = next == null ? hold.expiresAt : Math.min(next, hold.expiresAt);
+    }
+    for (const hold of this.missingStatusHolds.values()) {
       if (hold.parentSessionID !== parentSessionID)
         continue;
       next = next == null ? hold.expiresAt : Math.min(next, hold.expiresAt);
@@ -1038,17 +1133,30 @@ class TaskTracker {
       const data = Array.isArray(result) ? result : Array.isArray(result.data) ? result.data : [];
       childIDs = data.flatMap((child) => isRecord(child) && typeof child.id === "string" ? [child.id] : []);
     } catch {
+      writeContinuationDiag("task.children.refresh.error", { sessionID: parentSessionID, stage: "children" });
       return;
     }
-    if (childIDs.length === 0)
+    if (childIDs.length === 0) {
+      writeContinuationDiag("task.children.refresh", { sessionID: parentSessionID, childIDs: [] });
       return;
+    }
     let statuses;
     try {
       const result = await session.status();
       statuses = isRecord(result) && isRecord(result.data) ? result.data : isRecord(result) ? result : {};
     } catch {
+      writeContinuationDiag("task.children.refresh.error", { sessionID: parentSessionID, stage: "status", childIDs });
       return;
     }
+    writeContinuationDiag("task.children.refresh", {
+      sessionID: parentSessionID,
+      childIDs,
+      statuses: Object.fromEntries(childIDs.map((childID) => {
+        const status = statuses[childID];
+        const statusType = isRecord(status) && typeof status.type === "string" ? status.type : null;
+        return [childID, statusType];
+      }))
+    });
     for (const childID of childIDs) {
       const status = statuses[childID];
       const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined;
@@ -1059,12 +1167,15 @@ class TaskTracker {
           this.markTerminal(childID, "completed", parentSessionID);
         else
           this.markSnapshotIdle(parentSessionID, childID);
+      } else if (this.tasks.get(childID)?.state === "running") {
+        this.markMissingStatus(parentSessionID, childID);
       }
     }
   }
   markRunning(parentSessionID, taskID) {
     const existing = this.tasks.get(taskID);
     this.clearSnapshotIdle(parentSessionID, taskID);
+    this.clearMissingStatus(parentSessionID, taskID);
     this.tasks.set(taskID, {
       taskID,
       parentSessionID,
@@ -1073,6 +1184,7 @@ class TaskTracker {
       terminalAt: null,
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null
     });
+    writeContinuationDiag("task.mark.running", { sessionID: parentSessionID, taskID });
   }
   markTerminal(taskID, state, parentSessionID, options = {}) {
     if (!TASK_TERMINAL_STATES.has(state))
@@ -1082,6 +1194,7 @@ class TaskTracker {
     if (!resolvedParentSessionID)
       return;
     this.clearSnapshotIdle(resolvedParentSessionID, taskID);
+    this.clearMissingStatus(resolvedParentSessionID, taskID);
     if (existing && TASK_TERMINAL_STATES.has(existing.state) && !existing.terminalUnreconciled && !options.resetReconciled) {
       return;
     }
@@ -1093,6 +1206,13 @@ class TaskTracker {
       terminalAt: Date.now(),
       lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null
     });
+    writeContinuationDiag("task.mark.terminal", {
+      sessionID: resolvedParentSessionID,
+      taskID,
+      state,
+      terminalUnreconciled: true,
+      resetReconciled: options.resetReconciled === true
+    });
   }
   markSnapshotIdle(parentSessionID, taskID) {
     const key = this.snapshotIdleKey(parentSessionID, taskID);
@@ -1103,11 +1223,26 @@ class TaskTracker {
       parentSessionID,
       expiresAt: Date.now() + SNAPSHOT_IDLE_HOLD_MS
     });
+    writeContinuationDiag("task.snapshot-idle.hold", { sessionID: parentSessionID, taskID, holdMs: SNAPSHOT_IDLE_HOLD_MS });
+  }
+  markMissingStatus(parentSessionID, taskID) {
+    const key = this.snapshotIdleKey(parentSessionID, taskID);
+    if (this.missingStatusHolds.has(key))
+      return;
+    this.missingStatusHolds.set(key, {
+      taskID,
+      parentSessionID,
+      expiresAt: Date.now() + SNAPSHOT_IDLE_HOLD_MS
+    });
+    writeContinuationDiag("task.missing.retry", { sessionID: parentSessionID, taskID, retryMs: SNAPSHOT_IDLE_HOLD_MS });
   }
   clearSnapshotIdle(parentSessionID, taskID) {
     const key = this.snapshotIdleKey(parentSessionID, taskID);
     this.snapshotIdleHolds.delete(key);
     this.settledSnapshotIdleTasks.delete(key);
+  }
+  clearMissingStatus(parentSessionID, taskID) {
+    this.missingStatusHolds.delete(this.snapshotIdleKey(parentSessionID, taskID));
   }
   clearSnapshotIdleForSession(sessionID) {
     for (const [key, hold] of this.snapshotIdleHolds) {
@@ -1120,12 +1255,29 @@ class TaskTracker {
       }
     }
   }
+  clearMissingStatusForSession(sessionID) {
+    for (const [key, hold] of this.missingStatusHolds) {
+      if (hold.taskID === sessionID || hold.parentSessionID === sessionID)
+        this.missingStatusHolds.delete(key);
+    }
+  }
   pruneExpiredSnapshotIdleHolds(now = Date.now()) {
     for (const [key, hold] of this.snapshotIdleHolds) {
       if (hold.expiresAt > now)
         continue;
       this.snapshotIdleHolds.delete(key);
       this.settledSnapshotIdleTasks.add(key);
+    }
+  }
+  pruneExpiredMissingStatusHolds(now = Date.now()) {
+    for (const [key, hold] of this.missingStatusHolds) {
+      if (hold.expiresAt > now)
+        continue;
+      this.missingStatusHolds.delete(key);
+      const task = this.tasks.get(hold.taskID);
+      if (task?.parentSessionID === hold.parentSessionID && task.state === "running")
+        this.tasks.delete(hold.taskID);
+      writeContinuationDiag("task.missing.pruned", { sessionID: hold.parentSessionID, taskID: hold.taskID });
     }
   }
   snapshotIdleKey(parentSessionID, taskID) {
@@ -1138,6 +1290,7 @@ class TaskTracker {
         continue;
       if (this.assistantReconcilesTask(task, marker)) {
         this.tasks.set(task.taskID, { ...task, terminalUnreconciled: false });
+        writeContinuationDiag("task.reconciled", { sessionID, taskID: task.taskID, assistantMessageID: marker.id });
       }
     }
   }
@@ -1174,6 +1327,7 @@ function mergeSystemReminder(output, reminder) {
 ${reminder}`;
 }
 var server = async ({ client }, options) => {
+  continuationDiagEnabled = options?.debug_log === true;
   const autoContinue = options?.auto_continue ?? true;
   const deferWhileTasksActive = options?.defer_while_tasks_active ?? true;
   const maxAutoTurns = positiveIntegerOrNull2(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS;
@@ -1191,14 +1345,19 @@ var server = async ({ client }, options) => {
     await taskTracker.refreshLiveChildren(client, sessionID);
     return {
       blocked: taskTracker.hasBlockingTasks(sessionID),
-      retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID)
+      retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
+      summary: taskTracker.blockingSummary(sessionID)
     };
   }
   function scheduleSettledContinuation(sessionID, delayMs = TASK_SETTLE_DELAY_MS) {
-    if (scheduledContinuations.has(sessionID))
+    if (scheduledContinuations.has(sessionID)) {
+      writeContinuationDiag("continue.schedule.skip", { sessionID, reason: "already_scheduled" });
       return;
+    }
+    writeContinuationDiag("continue.schedule", { sessionID, delayMs: Math.max(0, delayMs) });
     const timer = setTimeout(() => {
       scheduledContinuations.delete(sessionID);
+      writeContinuationDiag("continue.schedule.fire", { sessionID });
       runAutoContinue(sessionID, true);
     }, Math.max(0, delayMs));
     const maybeUnref = timer;
@@ -1207,39 +1366,79 @@ var server = async ({ client }, options) => {
     scheduledContinuations.set(sessionID, timer);
   }
   async function runAutoContinue(sessionID, fromTaskDeferral = false) {
-    if (busySessions.has(sessionID))
+    writeContinuationDiag("continue.start", { sessionID, fromTaskDeferral });
+    if (busySessions.has(sessionID)) {
+      writeContinuationDiag("continue.skip", { sessionID, reason: "busy" });
       return;
-    if (activeContinuations.has(sessionID))
+    }
+    if (activeContinuations.has(sessionID)) {
+      writeContinuationDiag("continue.skip", { sessionID, reason: "already_active" });
       return;
+    }
     activeContinuations.add(sessionID);
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID);
+      writeContinuationDiag("continue.latest-assistant", {
+        sessionID,
+        messageID: latestAssistant ? messageID(latestAssistant) ?? null : null,
+        role: latestAssistant ? messageRole(latestAssistant) ?? null : null
+      });
       taskTracker.observeAssistantMessage(sessionID, latestAssistant);
       const taskStatus = await taskBlockStatus(sessionID);
+      writeContinuationDiag("continue.task-status", {
+        sessionID,
+        deferWhileTasksActive,
+        taskStatus
+      });
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID);
         if (taskStatus.retryAt != null)
           scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now());
+        writeContinuationDiag("continue.skip", { sessionID, reason: "task_blocked", taskStatus });
         return;
       }
-      if (busySessions.has(sessionID))
+      if (busySessions.has(sessionID)) {
+        writeContinuationDiag("continue.skip", { sessionID, reason: "busy_after_task_check" });
         return;
+      }
       await recordAssistantMessage(sessionID, latestAssistant, options ?? {});
+      writeContinuationDiag("continue.progress-recorded", { sessionID });
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID);
+        writeContinuationDiag("continue.skip", { sessionID, reason: "task_deferred_settling" });
         return;
       }
       taskDeferredSessions.delete(sessionID);
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval);
-      if (!goal)
+      writeContinuationDiag("continue.reserve", {
+        sessionID,
+        reserved: Boolean(goal),
+        goal: goal ? {
+          status: goal.status,
+          autoTurns: goal.autoTurns,
+          maxAutoTurns: goal.maxAutoTurns,
+          timeUsedSeconds: goal.timeUsedSeconds,
+          maxDurationSeconds: goal.maxDurationSeconds,
+          tokensUsed: goal.tokensUsed,
+          tokenBudget: goal.tokenBudget,
+          lastContinuationAt: goal.lastContinuationAt,
+          budgetWrapupSent: goal.budgetWrapupSent,
+          stopReason: goal.stopReason
+        } : null
+      });
+      if (!goal) {
+        writeContinuationDiag("continue.skip", { sessionID, reason: "reserve_returned_null" });
         return;
+      }
       await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal));
+      writeContinuationDiag("continue.prompt.sent", { sessionID, status: goal.status, autoTurns: goal.autoTurns });
       await recordContinuationResult(sessionID, "success", maxPromptFailures);
     } catch (error) {
+      writeContinuationDiag("continue.error", { sessionID, error });
       await recordContinuationResult(sessionID, "failure", maxPromptFailures);
       await client.app?.log?.({
         body: {
-          service: "opencode-goal-plugin",
+          service: DIAG_SERVICE,
           level: "error",
           message: "Auto-continue failed",
           extra: { error: error instanceof Error ? error.message : String(error) }
@@ -1247,6 +1446,7 @@ var server = async ({ client }, options) => {
       });
     } finally {
       activeContinuations.delete(sessionID);
+      writeContinuationDiag("continue.finish", { sessionID });
     }
   }
   return {
@@ -1400,6 +1600,16 @@ var server = async ({ client }, options) => {
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event);
       const eventType = event.type;
+      const idleEvent = isIdleEvent(event);
+      writeContinuationDiag("hook.event", {
+        sessionID: sessionID ?? null,
+        eventType: eventType ?? null,
+        idleEvent,
+        autoContinue,
+        status: isRecord(event.properties?.status) && typeof (event.properties?.status).type === "string" ? (event.properties?.status).type : null,
+        hasDirectSessionID: typeof event.properties?.sessionID === "string",
+        hasInfoSessionID: isRecord(event.properties?.info) && typeof (event.properties?.info).sessionID === "string"
+      });
       if (eventType === "session.created") {
         taskTracker.observeSessionCreated(event);
       }
@@ -1427,10 +1637,16 @@ var server = async ({ client }, options) => {
         taskTracker.observeAssistantMessage(sessionID, message);
         await recordAssistantMessage(sessionID, message, options ?? {});
       }
-      if (!autoContinue || !isIdleEvent(event))
+      if (!autoContinue || !idleEvent) {
+        if (idleEvent)
+          writeContinuationDiag("hook.skip", { sessionID: sessionID ?? null, reason: "auto_continue_disabled" });
         return;
-      if (!sessionID)
+      }
+      if (!sessionID) {
+        writeContinuationDiag("hook.skip", { reason: "missing_session_id", eventType: eventType ?? null });
         return;
+      }
+      writeContinuationDiag("hook.run", { sessionID, eventType: eventType ?? null });
       await runAutoContinue(sessionID);
     }
   };

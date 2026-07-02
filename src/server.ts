@@ -1,3 +1,6 @@
+import { appendFile as appendDebugLogFile, mkdir as makeDebugLogDir } from "node:fs/promises"
+import { homedir as userHomeDir } from "node:os"
+import { dirname as pathDirname, join as pathJoin } from "node:path"
 import type { Config, Plugin } from "@opencode-ai/plugin"
 import { z } from "zod"
 import {
@@ -29,6 +32,7 @@ type Options = {
   max_goal_duration_seconds?: number
   no_progress_token_threshold?: number
   max_no_progress_turns?: number
+  debug_log?: boolean
 }
 
 type CreateGoalArgs = {
@@ -59,6 +63,7 @@ const TASK_SETTLE_DELAY_MS = 25
 const SNAPSHOT_IDLE_HOLD_MS = 250
 const TASK_TERMINAL_STATES = new Set<TaskState>(["completed", "error", "cancelled"])
 const activeContinuations = new Set<string>()
+const DIAG_SERVICE = "opencode-goal-plugin"
 
 type TaskState = "running" | "completed" | "error" | "cancelled"
 
@@ -85,6 +90,62 @@ type SnapshotIdleHold = {
   taskID: string
   parentSessionID: string
   expiresAt: number
+}
+
+type MissingStatusHold = {
+  taskID: string
+  parentSessionID: string
+  expiresAt: number
+}
+
+let continuationDiagEnabled = false
+
+function defaultDebugLogDir() {
+  const dataHome =
+    process.env.XDG_DATA_HOME ||
+    (process.platform === "win32" && process.env.APPDATA ? process.env.APPDATA : pathJoin(userHomeDir(), ".local", "share"))
+  return pathJoin(dataHome, "opencode-goal-plugin", "debug-log")
+}
+
+function debugLogDir() {
+  return process.env.OPENCODE_GOAL_DEBUG_LOG_DIR || defaultDebugLogDir()
+}
+
+function safeDebugLogSessionID(value: unknown) {
+  if (typeof value !== "string" || value.length === 0) return "_global"
+  const safe = value.replace(/[^A-Za-z0-9._-]/g, "_")
+  return safe || "_global"
+}
+
+function debugLogPath(extra: Record<string, unknown>) {
+  return pathJoin(debugLogDir(), `${safeDebugLogSessionID(extra.sessionID)}.jsonl`)
+}
+
+function sanitizeDiagValue(value: unknown): unknown {
+  if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack }
+  if (typeof value === "bigint") return value.toString()
+  if (value == null || typeof value !== "object") return value
+  if (Array.isArray(value)) return value.map(sanitizeDiagValue)
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, sanitizeDiagValue(entry)]))
+}
+
+async function writeContinuationDiag(event: string, extra: Record<string, unknown> = {}) {
+  if (!continuationDiagEnabled) return
+  const file = debugLogPath(extra)
+  const sanitized = sanitizeDiagValue(extra) as Record<string, unknown>
+  const line =
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      service: DIAG_SERVICE,
+      event,
+      ...sanitized,
+    }) + "\n"
+  try {
+    await makeDebugLogDir(pathDirname(file), { recursive: true, mode: 0o700 })
+    await appendDebugLogFile(file, line, { mode: 0o600 })
+  } catch {
+    // Diagnostic logging must never affect goal continuation.
+  }
 }
 
 function goalCommandTemplate(commandName: string) {
@@ -309,12 +370,16 @@ class TaskTracker {
   private readonly pendingTaskCalls = new Map<string, string>()
   private readonly latestAssistantBySession = new Map<string, AssistantMarker>()
   private readonly snapshotIdleHolds = new Map<string, SnapshotIdleHold>()
+  private readonly missingStatusHolds = new Map<string, MissingStatusHold>()
   private readonly settledSnapshotIdleTasks = new Set<string>()
 
   noteTaskCall(input: { tool?: unknown; sessionID?: unknown; callID?: unknown }) {
     if (typeof input.tool !== "string" || input.tool.toLowerCase() !== "task") return
     if (typeof input.sessionID !== "string") return
-    if (typeof input.callID === "string") this.pendingTaskCalls.set(input.callID, input.sessionID)
+    if (typeof input.callID === "string") {
+      this.pendingTaskCalls.set(input.callID, input.sessionID)
+      void writeContinuationDiag("task.call", { sessionID: input.sessionID, callID: input.callID })
+    }
   }
 
   noteTaskOutput(input: { tool?: unknown; sessionID?: unknown; callID?: unknown }, output: { output?: unknown }) {
@@ -324,7 +389,15 @@ class TaskTracker {
     if (typeof input.callID === "string") this.pendingTaskCalls.delete(input.callID)
     if (typeof parentSessionID !== "string") return
     const status = parseTaskStatus(output.output)
-    if (!status) return
+    if (!status) {
+      void writeContinuationDiag("task.output.unparsed", {
+        sessionID: parentSessionID,
+        callID: input.callID,
+        outputPreview: typeof output.output === "string" ? output.output.slice(0, 500) : typeof output.output,
+      })
+      return
+    }
+    void writeContinuationDiag("task.output", { sessionID: parentSessionID, callID: input.callID, ...status })
     if (status.state === "running") {
       this.markRunning(parentSessionID, status.taskID)
       return
@@ -335,12 +408,14 @@ class TaskTracker {
   observeSessionCreated(event: { properties?: Record<string, unknown> }) {
     const info = event.properties?.info
     if (!isRecord(info) || typeof info.id !== "string" || typeof info.parentID !== "string") return
+    void writeContinuationDiag("task.session.created", { sessionID: info.parentID, taskID: info.id })
     this.markRunning(info.parentID, info.id)
   }
 
   observeSessionStatus(sessionID: string, status: string) {
     const task = this.tasks.get(sessionID)
     if (!task) return
+    void writeContinuationDiag("task.session.status", { sessionID: task.parentSessionID, taskID: sessionID, status })
     if (status === "busy") {
       this.markRunning(task.parentSessionID, sessionID)
       return
@@ -355,6 +430,7 @@ class TaskTracker {
     }
     this.latestAssistantBySession.delete(sessionID)
     this.clearSnapshotIdleForSession(sessionID)
+    this.clearMissingStatusForSession(sessionID)
   }
 
   observeMessages(messages: { info?: unknown; role?: unknown; id?: unknown; time?: unknown; parts?: unknown[] }[]) {
@@ -385,6 +461,7 @@ class TaskTracker {
 
   hasBlockingTasks(parentSessionID: string) {
     this.pruneExpiredSnapshotIdleHolds()
+    this.pruneExpiredMissingStatusHolds()
     for (const task of this.tasks.values()) {
       if (task.parentSessionID !== parentSessionID) continue
       if (task.state === "running" || task.terminalUnreconciled) return true
@@ -392,13 +469,50 @@ class TaskTracker {
     for (const hold of this.snapshotIdleHolds.values()) {
       if (hold.parentSessionID === parentSessionID) return true
     }
+    for (const hold of this.missingStatusHolds.values()) {
+      if (hold.parentSessionID === parentSessionID) return true
+    }
     return false
+  }
+
+  blockingSummary(parentSessionID: string) {
+    this.pruneExpiredSnapshotIdleHolds()
+    this.pruneExpiredMissingStatusHolds()
+    const tasks = [...this.tasks.values()]
+      .filter((task) => task.parentSessionID === parentSessionID)
+      .map((task) => ({
+        taskID: task.taskID,
+        state: task.state,
+        terminalUnreconciled: task.terminalUnreconciled,
+        terminalAt: task.terminalAt,
+        lastAssistantMessageIDAtTerminal: task.lastAssistantMessageIDAtTerminal,
+      }))
+    const holds = [...this.snapshotIdleHolds.values()]
+      .filter((hold) => hold.parentSessionID === parentSessionID)
+      .map((hold) => ({ taskID: hold.taskID, expiresAt: hold.expiresAt, remainingMs: Math.max(0, hold.expiresAt - Date.now()) }))
+    const missingStatusHolds = [...this.missingStatusHolds.values()]
+      .filter((hold) => hold.parentSessionID === parentSessionID)
+      .map((hold) => ({ taskID: hold.taskID, expiresAt: hold.expiresAt, remainingMs: Math.max(0, hold.expiresAt - Date.now()) }))
+    return {
+      tasks,
+      holds,
+      missingStatusHolds,
+      runningTasks: tasks.filter((task) => task.state === "running").length,
+      terminalUnreconciledTasks: tasks.filter((task) => task.terminalUnreconciled).length,
+      snapshotIdleHolds: holds.length,
+      missingStatusHoldCount: missingStatusHolds.length,
+    }
   }
 
   nextSnapshotIdleRetryAt(parentSessionID: string) {
     this.pruneExpiredSnapshotIdleHolds()
+    this.pruneExpiredMissingStatusHolds()
     let next: number | null = null
     for (const hold of this.snapshotIdleHolds.values()) {
+      if (hold.parentSessionID !== parentSessionID) continue
+      next = next == null ? hold.expiresAt : Math.min(next, hold.expiresAt)
+    }
+    for (const hold of this.missingStatusHolds.values()) {
       if (hold.parentSessionID !== parentSessionID) continue
       next = next == null ? hold.expiresAt : Math.min(next, hold.expiresAt)
     }
@@ -417,16 +531,32 @@ class TaskTracker {
       const data = Array.isArray(result) ? result : Array.isArray(result.data) ? result.data : []
       childIDs = data.flatMap((child) => (isRecord(child) && typeof child.id === "string" ? [child.id] : []))
     } catch {
+      void writeContinuationDiag("task.children.refresh.error", { sessionID: parentSessionID, stage: "children" })
       return
     }
-    if (childIDs.length === 0) return
+    if (childIDs.length === 0) {
+      void writeContinuationDiag("task.children.refresh", { sessionID: parentSessionID, childIDs: [] })
+      return
+    }
     let statuses: Record<string, unknown>
     try {
       const result = await session.status()
       statuses = isRecord(result) && isRecord(result.data) ? result.data : isRecord(result) ? result : {}
     } catch {
+      void writeContinuationDiag("task.children.refresh.error", { sessionID: parentSessionID, stage: "status", childIDs })
       return
     }
+    void writeContinuationDiag("task.children.refresh", {
+      sessionID: parentSessionID,
+      childIDs,
+      statuses: Object.fromEntries(
+        childIDs.map((childID) => {
+          const status = statuses[childID]
+          const statusType = isRecord(status) && typeof status.type === "string" ? status.type : null
+          return [childID, statusType]
+        }),
+      ),
+    })
     for (const childID of childIDs) {
       const status = statuses[childID]
       const statusType = isRecord(status) && typeof status.type === "string" ? status.type : undefined
@@ -434,6 +564,10 @@ class TaskTracker {
       else if (statusType === "idle") {
         if (this.tasks.has(childID)) this.markTerminal(childID, "completed", parentSessionID)
         else this.markSnapshotIdle(parentSessionID, childID)
+      } else if (this.tasks.get(childID)?.state === "running") {
+        // Missing/null live status means the child is unobservable, not safely running.
+        // Hold briefly for status races, then prune rather than deadlock continuation.
+        this.markMissingStatus(parentSessionID, childID)
       }
     }
   }
@@ -441,6 +575,7 @@ class TaskTracker {
   private markRunning(parentSessionID: string, taskID: string) {
     const existing = this.tasks.get(taskID)
     this.clearSnapshotIdle(parentSessionID, taskID)
+    this.clearMissingStatus(parentSessionID, taskID)
     this.tasks.set(taskID, {
       taskID,
       parentSessionID,
@@ -449,6 +584,7 @@ class TaskTracker {
       terminalAt: null,
       lastAssistantMessageIDAtTerminal: existing?.lastAssistantMessageIDAtTerminal ?? null,
     })
+    void writeContinuationDiag("task.mark.running", { sessionID: parentSessionID, taskID })
   }
 
   private markTerminal(
@@ -462,6 +598,7 @@ class TaskTracker {
     const resolvedParentSessionID = existing?.parentSessionID ?? parentSessionID
     if (!resolvedParentSessionID) return
     this.clearSnapshotIdle(resolvedParentSessionID, taskID)
+    this.clearMissingStatus(resolvedParentSessionID, taskID)
     if (
       existing &&
       TASK_TERMINAL_STATES.has(existing.state) &&
@@ -478,6 +615,13 @@ class TaskTracker {
       terminalAt: Date.now(),
       lastAssistantMessageIDAtTerminal: this.latestAssistantBySession.get(resolvedParentSessionID)?.id ?? null,
     })
+    void writeContinuationDiag("task.mark.terminal", {
+      sessionID: resolvedParentSessionID,
+      taskID,
+      state,
+      terminalUnreconciled: true,
+      resetReconciled: options.resetReconciled === true,
+    })
   }
 
   private markSnapshotIdle(parentSessionID: string, taskID: string) {
@@ -488,12 +632,28 @@ class TaskTracker {
       parentSessionID,
       expiresAt: Date.now() + SNAPSHOT_IDLE_HOLD_MS,
     })
+    void writeContinuationDiag("task.snapshot-idle.hold", { sessionID: parentSessionID, taskID, holdMs: SNAPSHOT_IDLE_HOLD_MS })
+  }
+
+  private markMissingStatus(parentSessionID: string, taskID: string) {
+    const key = this.snapshotIdleKey(parentSessionID, taskID)
+    if (this.missingStatusHolds.has(key)) return
+    this.missingStatusHolds.set(key, {
+      taskID,
+      parentSessionID,
+      expiresAt: Date.now() + SNAPSHOT_IDLE_HOLD_MS,
+    })
+    void writeContinuationDiag("task.missing.retry", { sessionID: parentSessionID, taskID, retryMs: SNAPSHOT_IDLE_HOLD_MS })
   }
 
   private clearSnapshotIdle(parentSessionID: string, taskID: string) {
     const key = this.snapshotIdleKey(parentSessionID, taskID)
     this.snapshotIdleHolds.delete(key)
     this.settledSnapshotIdleTasks.delete(key)
+  }
+
+  private clearMissingStatus(parentSessionID: string, taskID: string) {
+    this.missingStatusHolds.delete(this.snapshotIdleKey(parentSessionID, taskID))
   }
 
   private clearSnapshotIdleForSession(sessionID: string) {
@@ -507,11 +667,29 @@ class TaskTracker {
     }
   }
 
+  private clearMissingStatusForSession(sessionID: string) {
+    for (const [key, hold] of this.missingStatusHolds) {
+      if (hold.taskID === sessionID || hold.parentSessionID === sessionID) this.missingStatusHolds.delete(key)
+    }
+  }
+
   private pruneExpiredSnapshotIdleHolds(now = Date.now()) {
     for (const [key, hold] of this.snapshotIdleHolds) {
       if (hold.expiresAt > now) continue
       this.snapshotIdleHolds.delete(key)
       this.settledSnapshotIdleTasks.add(key)
+    }
+  }
+
+  private pruneExpiredMissingStatusHolds(now = Date.now()) {
+    for (const [key, hold] of this.missingStatusHolds) {
+      if (hold.expiresAt > now) continue
+      this.missingStatusHolds.delete(key)
+      const task = this.tasks.get(hold.taskID)
+      // No terminal event exists for an unobservable child, so there is nothing
+      // for the parent assistant to reconcile. Drop only stale running records.
+      if (task?.parentSessionID === hold.parentSessionID && task.state === "running") this.tasks.delete(hold.taskID)
+      void writeContinuationDiag("task.missing.pruned", { sessionID: hold.parentSessionID, taskID: hold.taskID })
     }
   }
 
@@ -525,6 +703,7 @@ class TaskTracker {
       if (task.parentSessionID !== sessionID || !task.terminalUnreconciled) continue
       if (this.assistantReconcilesTask(task, marker)) {
         this.tasks.set(task.taskID, { ...task, terminalUnreconciled: false })
+        void writeContinuationDiag("task.reconciled", { sessionID, taskID: task.taskID, assistantMessageID: marker.id })
       }
     }
   }
@@ -562,6 +741,7 @@ function mergeSystemReminder(output: { system: string[] }, reminder: string) {
 }
 
 const server: Plugin = async ({ client }, options?: Options) => {
+  continuationDiagEnabled = options?.debug_log === true
   const autoContinue = options?.auto_continue ?? true
   const deferWhileTasksActive = options?.defer_while_tasks_active ?? true
   const maxAutoTurns = positiveIntegerOrNull(options?.max_auto_turns) ?? DEFAULT_MAX_AUTO_TURNS
@@ -580,13 +760,19 @@ const server: Plugin = async ({ client }, options?: Options) => {
     return {
       blocked: taskTracker.hasBlockingTasks(sessionID),
       retryAt: taskTracker.nextSnapshotIdleRetryAt(sessionID),
+      summary: taskTracker.blockingSummary(sessionID),
     }
   }
 
   function scheduleSettledContinuation(sessionID: string, delayMs = TASK_SETTLE_DELAY_MS) {
-    if (scheduledContinuations.has(sessionID)) return
+    if (scheduledContinuations.has(sessionID)) {
+      void writeContinuationDiag("continue.schedule.skip", { sessionID, reason: "already_scheduled" })
+      return
+    }
+    void writeContinuationDiag("continue.schedule", { sessionID, delayMs: Math.max(0, delayMs) })
     const timer = setTimeout(() => {
       scheduledContinuations.delete(sessionID)
+      void writeContinuationDiag("continue.schedule.fire", { sessionID })
       void runAutoContinue(sessionID, true)
     }, Math.max(0, delayMs))
     const maybeUnref = timer as { unref?: () => void }
@@ -595,34 +781,80 @@ const server: Plugin = async ({ client }, options?: Options) => {
   }
 
   async function runAutoContinue(sessionID: string, fromTaskDeferral = false) {
-    if (busySessions.has(sessionID)) return
-    if (activeContinuations.has(sessionID)) return
+    void writeContinuationDiag("continue.start", { sessionID, fromTaskDeferral })
+    if (busySessions.has(sessionID)) {
+      void writeContinuationDiag("continue.skip", { sessionID, reason: "busy" })
+      return
+    }
+    if (activeContinuations.has(sessionID)) {
+      void writeContinuationDiag("continue.skip", { sessionID, reason: "already_active" })
+      return
+    }
     activeContinuations.add(sessionID)
     try {
       const latestAssistant = await fetchLatestAssistant(client, sessionID)
+      void writeContinuationDiag("continue.latest-assistant", {
+        sessionID,
+        messageID: latestAssistant ? messageID(latestAssistant) ?? null : null,
+        role: latestAssistant ? messageRole(latestAssistant) ?? null : null,
+      })
       taskTracker.observeAssistantMessage(sessionID, latestAssistant)
       const taskStatus = await taskBlockStatus(sessionID)
+      void writeContinuationDiag("continue.task-status", {
+        sessionID,
+        deferWhileTasksActive,
+        taskStatus,
+      })
       if (taskStatus && taskStatus.blocked) {
         taskDeferredSessions.add(sessionID)
         if (taskStatus.retryAt != null) scheduleSettledContinuation(sessionID, taskStatus.retryAt - Date.now())
+        void writeContinuationDiag("continue.skip", { sessionID, reason: "task_blocked", taskStatus })
         return
       }
-      if (busySessions.has(sessionID)) return
+      if (busySessions.has(sessionID)) {
+        void writeContinuationDiag("continue.skip", { sessionID, reason: "busy_after_task_check" })
+        return
+      }
       await recordAssistantMessage(sessionID, latestAssistant, options ?? {})
+      void writeContinuationDiag("continue.progress-recorded", { sessionID })
       if (!fromTaskDeferral && taskDeferredSessions.has(sessionID)) {
         scheduleSettledContinuation(sessionID)
+        void writeContinuationDiag("continue.skip", { sessionID, reason: "task_deferred_settling" })
         return
       }
       taskDeferredSessions.delete(sessionID)
       const goal = await reserveContinuation(sessionID, maxAutoTurns, minInterval)
-      if (!goal) return
+      void writeContinuationDiag("continue.reserve", {
+        sessionID,
+        reserved: Boolean(goal),
+        goal: goal
+          ? {
+              status: goal.status,
+              autoTurns: goal.autoTurns,
+              maxAutoTurns: goal.maxAutoTurns,
+              timeUsedSeconds: goal.timeUsedSeconds,
+              maxDurationSeconds: goal.maxDurationSeconds,
+              tokensUsed: goal.tokensUsed,
+              tokenBudget: goal.tokenBudget,
+              lastContinuationAt: goal.lastContinuationAt,
+              budgetWrapupSent: goal.budgetWrapupSent,
+              stopReason: goal.stopReason,
+            }
+          : null,
+      })
+      if (!goal) {
+        void writeContinuationDiag("continue.skip", { sessionID, reason: "reserve_returned_null" })
+        return
+      }
       await sendContinuation(client, sessionID, goal.status === "active" ? continuationPrompt(goal) : limitPrompt(goal))
+      void writeContinuationDiag("continue.prompt.sent", { sessionID, status: goal.status, autoTurns: goal.autoTurns })
       await recordContinuationResult(sessionID, "success", maxPromptFailures)
     } catch (error) {
+      void writeContinuationDiag("continue.error", { sessionID, error })
       await recordContinuationResult(sessionID, "failure", maxPromptFailures)
       await client.app?.log?.({
         body: {
-          service: "opencode-goal-plugin",
+          service: DIAG_SERVICE,
           level: "error",
           message: "Auto-continue failed",
           extra: { error: error instanceof Error ? error.message : String(error) },
@@ -630,6 +862,7 @@ const server: Plugin = async ({ client }, options?: Options) => {
       })
     } finally {
       activeContinuations.delete(sessionID)
+      void writeContinuationDiag("continue.finish", { sessionID })
     }
   }
 
@@ -798,6 +1031,22 @@ const server: Plugin = async ({ client }, options?: Options) => {
     async event({ event }) {
       const sessionID = sessionIDFromEvent(event as never)
       const eventType = (event as { type?: string }).type
+      const idleEvent = isIdleEvent(event as never)
+      void writeContinuationDiag("hook.event", {
+        sessionID: sessionID ?? null,
+        eventType: eventType ?? null,
+        idleEvent,
+        autoContinue,
+        status:
+          isRecord((event as { properties?: Record<string, unknown> }).properties?.status) &&
+          typeof ((event as { properties?: Record<string, unknown> }).properties?.status as Record<string, unknown>).type === "string"
+            ? ((event as { properties?: Record<string, unknown> }).properties?.status as Record<string, unknown>).type
+            : null,
+        hasDirectSessionID: typeof (event as { properties?: Record<string, unknown> }).properties?.sessionID === "string",
+        hasInfoSessionID:
+          isRecord((event as { properties?: Record<string, unknown> }).properties?.info) &&
+          typeof ((event as { properties?: Record<string, unknown> }).properties?.info as Record<string, unknown>).sessionID === "string",
+      })
       if (eventType === "session.created") {
         taskTracker.observeSessionCreated(event as { properties?: Record<string, unknown> })
       }
@@ -826,8 +1075,15 @@ const server: Plugin = async ({ client }, options?: Options) => {
         await recordAssistantMessage(sessionID, message, options ?? {})
       }
 
-      if (!autoContinue || !isIdleEvent(event as never)) return
-      if (!sessionID) return
+      if (!autoContinue || !idleEvent) {
+        if (idleEvent) void writeContinuationDiag("hook.skip", { sessionID: sessionID ?? null, reason: "auto_continue_disabled" })
+        return
+      }
+      if (!sessionID) {
+        void writeContinuationDiag("hook.skip", { reason: "missing_session_id", eventType: eventType ?? null })
+        return
+      }
+      void writeContinuationDiag("hook.run", { sessionID, eventType: eventType ?? null })
       await runAutoContinue(sessionID)
     },
   }

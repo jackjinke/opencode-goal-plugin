@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { access, mkdtemp, readFile, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import plugin from "../src/server"
@@ -32,8 +32,27 @@ beforeEach(async () => {
 
 afterEach(async () => {
   delete process.env.OPENCODE_GOAL_STATE_PATH
+  delete process.env.OPENCODE_GOAL_DEBUG_LOG_DIR
   await rm(dir, { recursive: true, force: true })
 })
+
+async function pathExists(path: string) {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForFileContent(path: string, text: string) {
+  const deadline = Date.now() + 500
+  while (Date.now() < deadline) {
+    if ((await pathExists(path)) && (await readFile(path, "utf8")).includes(text)) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  expect(await readFile(path, "utf8")).toContain(text)
+}
 
 test("server plugin exposes Codex-style goal tools", async () => {
   const calls: unknown[] = []
@@ -678,6 +697,42 @@ test("live child session status blocks goal continuation when task launch was mi
   expect(calls).toHaveLength(0)
 })
 
+test("missing live status for known running child retries briefly then prunes", async () => {
+  const calls: unknown[] = []
+  const debugLogDir = join(dir, "debug-log")
+  const sessionDebugLogPath = join(debugLogDir, "ses_1.jsonl")
+  process.env.OPENCODE_GOAL_DEBUG_LOG_DIR = debugLogDir
+  const hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          children: async () => ({ data: [{ id: "task_1" }] }),
+          status: async () => ({ data: { task_1: null } }),
+          promptAsync: async (input: unknown) => {
+            calls.push(input)
+          },
+        },
+      },
+    } as never,
+    { auto_continue: true, debug_log: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  const tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks["tool.execute.after"]?.(
+    { tool: "Task", sessionID: "ses_1", callID: "call_1", args: {} } as never,
+    { title: "Task", output: "task_id: task_1\nstate: running", metadata: {} } as never,
+  )
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+
+  expect(calls).toHaveLength(0)
+  await waitForContinuation(calls)
+  expect(JSON.stringify(calls[0])).toContain("Continue working toward the active session goal")
+  await waitForFileContent(sessionDebugLogPath, '"event":"task.missing.retry"')
+  expect(await readFile(sessionDebugLogPath, "utf8")).toContain('"event":"task.missing.pruned"')
+})
+
 test("idle live child session uses bounded deferral when task launch was missed", async () => {
   const calls: unknown[] = []
   const hooks = await plugin.server(
@@ -765,6 +820,51 @@ test("task deferral can be disabled with config", async () => {
   await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
 
   expect(calls).toHaveLength(1)
+})
+
+test("continuation diagnostics default off and enable with config", async () => {
+  const defaultDebugLogDir = join(dir, "default-debug-log")
+  const defaultSessionDebugLogPath = join(defaultDebugLogDir, "ses_1.jsonl")
+  process.env.OPENCODE_GOAL_DEBUG_LOG_DIR = defaultDebugLogDir
+  let hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  let tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_1" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_1" } } as never })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+
+  expect(await pathExists(defaultSessionDebugLogPath)).toBe(false)
+
+  const enabledDebugLogDir = join(dir, "enabled-debug-log")
+  const enabledSessionDebugLogPath = join(enabledDebugLogDir, "ses_2.jsonl")
+  process.env.OPENCODE_GOAL_STATE_PATH = join(dir, "goals-enabled.json")
+  process.env.OPENCODE_GOAL_DEBUG_LOG_DIR = enabledDebugLogDir
+  hooks = await plugin.server(
+    {
+      client: {
+        session: {
+          promptAsync: async () => {},
+        },
+      },
+    } as never,
+    { auto_continue: true, debug_log: true, max_auto_turns: 1, min_continue_interval_seconds: 0 },
+  )
+  tools = hooks.tool
+  if (!tools) throw new Error("expected goal tools to be registered")
+
+  await requireTool(tools.create_goal, "create_goal").execute({ objective: "keep going" }, { sessionID: "ses_2" } as never)
+  await hooks.event!({ event: { type: "session.idle", properties: { sessionID: "ses_2" } } as never })
+  await waitForFileContent(enabledSessionDebugLogPath, '"event":"hook.event"')
 })
 
 test("auto-continue failures pause after configured retry limit", async () => {
